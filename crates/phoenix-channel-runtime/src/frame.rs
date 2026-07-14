@@ -1,18 +1,19 @@
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::Payload;
 
 /// A Phoenix Channels v2 JSON frame.
 ///
 /// The serialized representation is
 /// `[join_ref, ref, topic, event, payload]`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub join_ref: Option<String>,
     pub reference: Option<String>,
     pub topic: String,
     pub event: String,
-    pub payload: Value,
+    pub payload: Payload,
 }
 
 impl Frame {
@@ -21,14 +22,14 @@ impl Frame {
         reference: Option<String>,
         topic: impl Into<String>,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Self {
         Self {
             join_ref,
             reference,
             topic: topic.into(),
             event: event.into(),
-            payload,
+            payload: payload.into(),
         }
     }
 
@@ -38,7 +39,9 @@ impl Frame {
             &self.reference,
             &self.topic,
             &self.event,
-            &self.payload,
+            self.payload
+                .as_json()
+                .ok_or(FrameCodecError::BinaryPayloadRequiresBinaryFrame)?,
         ))
         .map_err(FrameCodecError::Encode)
     }
@@ -65,7 +68,7 @@ impl Frame {
             reference,
             topic,
             event,
-            payload: values[4].clone(),
+            payload: Payload::Json(values[4].clone()),
         })
     }
 }
@@ -89,6 +92,8 @@ pub enum FrameCodecError {
     InvalidLength(usize),
     #[error("Phoenix frame contains an invalid {0} field")]
     InvalidField(&'static str),
+    #[error("binary payloads require a binary Phoenix frame")]
+    BinaryPayloadRequiresBinaryFrame,
 }
 
 #[cfg(test)]

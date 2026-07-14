@@ -11,7 +11,7 @@ use std::{
 use phoenix_channel_client::{
     ChannelEvent, ConnectionConfig, Endpoint, Options, Socket, SocketEvent, static_join_payload,
 };
-use phoenix_channel_runtime::{ProtocolEvent, ReplyStatus};
+use phoenix_channel_runtime::{Payload, ProtocolEvent, ReplyStatus};
 use phoenix_channel_runtime_native::{NativeConnector, NativeSocket, NativeTimer};
 use serde_json::json;
 
@@ -113,6 +113,12 @@ async fn interoperates_with_a_real_phoenix_server() {
             assert_eq!(reply.response, json!({"value": 42}));
 
             let reply = channel
+                .call("binary", vec![1, 2, 3, 4])
+                .await
+                .expect("binary call should succeed");
+            assert_eq!(reply.response, Payload::Binary(vec![4, 3, 2, 1]));
+
+            let reply = channel
                 .call("broadcast", json!({"value": "hello"}))
                 .await
                 .expect("broadcast call should succeed");
@@ -177,6 +183,11 @@ async fn interoperates_with_a_real_phoenix_server() {
     .expect("Send channel task should complete")
     .expect("native call should succeed");
     assert_eq!(reply.response, json!({"from": "tokio task"}));
+    let reply = channel
+        .call("binary", vec![5, 6, 7])
+        .await
+        .expect("native binary call should succeed");
+    assert_eq!(reply.response, Payload::Binary(vec![7, 6, 5]));
 
     socket
         .disconnect()

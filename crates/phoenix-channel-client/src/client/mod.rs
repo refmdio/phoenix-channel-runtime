@@ -28,8 +28,8 @@ use futures::{
     stream::FuturesUnordered,
 };
 use phoenix_channel_runtime::{
-    ChannelState, Frame, Protocol, ProtocolEvent, ReplyStatus, Transport, TransportClose,
-    TransportError, TransportErrorKind, TransportEvent, WireMessage,
+    ChannelState, Codec, Frame, Payload, PhoenixV2Codec, Protocol, ProtocolEvent, ReplyStatus,
+    Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -108,7 +108,7 @@ pub enum ChannelStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reply {
     pub status: ReplyStatus,
-    pub response: Value,
+    pub response: Payload,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -151,8 +151,8 @@ pub enum ClientError {
     Protocol(String),
     #[error("join payload loader failed for {topic}: {message}")]
     JoinPayload { topic: String, message: String },
-    #[error("channel join was rejected for {topic}: {response}")]
-    JoinRejected { topic: String, response: Value },
+    #[error("channel join was rejected for {topic}: {response:?}")]
+    JoinRejected { topic: String, response: Payload },
     #[error("unknown channel topic: {0}")]
     UnknownTopic(String),
 }
@@ -231,6 +231,15 @@ impl Socket {
         timer: impl Timer + 'static,
         options: Options,
     ) -> (Self, Driver) {
+        Self::new_with_codec(connector, timer, options, PhoenixV2Codec)
+    }
+
+    pub fn new_with_codec(
+        connector: impl Connector + 'static,
+        timer: impl Timer + 'static,
+        options: Options,
+        codec: impl Codec + 'static,
+    ) -> (Self, Driver) {
         let (commands, command_rx) = mpsc::channel(options.command_capacity);
         let (lifecycle, lifecycle_rx) = mpsc::unbounded();
         let timer: Rc<dyn Timer> = Rc::new(timer);
@@ -252,6 +261,7 @@ impl Socket {
             Rc::new(connector),
             timer,
             options,
+            Rc::new(codec),
             command_rx,
             lifecycle_rx,
             status,
@@ -395,7 +405,7 @@ impl Channel {
         self.status.subscribe()
     }
 
-    pub async fn join(&self) -> Result<Value, ClientError> {
+    pub async fn join(&self) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
         self.send(Command::Join {
@@ -411,7 +421,7 @@ impl Channel {
     pub async fn call(
         &self,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<Reply, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -419,7 +429,7 @@ impl Channel {
             id,
             topic: self.topic.clone(),
             event: event.into(),
-            payload,
+            payload: payload.into(),
             response,
         })
         .await?;
@@ -428,14 +438,18 @@ impl Channel {
     }
 
     /// Sends an event without asking Phoenix for a reply.
-    pub async fn cast(&self, event: impl Into<String>, payload: Value) -> Result<(), ClientError> {
+    pub async fn cast(
+        &self,
+        event: impl Into<String>,
+        payload: impl Into<Payload>,
+    ) -> Result<(), ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
         self.send(Command::Cast {
             id,
             topic: self.topic.clone(),
             event: event.into(),
-            payload,
+            payload: payload.into(),
             response,
         })
         .await?;
@@ -443,7 +457,7 @@ impl Channel {
             .await
     }
 
-    pub async fn leave(&self) -> Result<Value, ClientError> {
+    pub async fn leave(&self) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
         self.send(Command::Leave {
@@ -609,26 +623,26 @@ enum Command {
     Join {
         id: RequestId,
         topic: String,
-        response: oneshot::Sender<Result<Value, ClientError>>,
+        response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Call {
         id: RequestId,
         topic: String,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
         id: RequestId,
         topic: String,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Leave {
         id: RequestId,
         topic: String,
-        response: oneshot::Sender<Result<Value, ClientError>>,
+        response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Shutdown {
         response: oneshot::Sender<()>,
@@ -639,13 +653,13 @@ enum QueuedPush {
     Call {
         id: RequestId,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
         id: RequestId,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
 }
@@ -686,7 +700,7 @@ struct ChannelRecord {
     active_payload: Option<u64>,
     join_attempt: u32,
     rejoin_scheduled: bool,
-    join_waiters: HashMap<RequestId, oneshot::Sender<Result<Value, ClientError>>>,
+    join_waiters: HashMap<RequestId, oneshot::Sender<Result<Payload, ClientError>>>,
     queued: VecDeque<QueuedPush>,
     deferred_leave: Option<PendingLeave>,
 }
@@ -703,7 +717,7 @@ struct PendingCall {
 
 struct PendingLeave {
     id: RequestId,
-    response: Option<oneshot::Sender<Result<Value, ClientError>>>,
+    response: Option<oneshot::Sender<Result<Payload, ClientError>>>,
 }
 
 type PayloadResult = (String, u64, Result<Value, String>);
@@ -717,6 +731,7 @@ struct DriverState {
     connector: Rc<dyn Connector>,
     timer: Rc<dyn Timer>,
     options: Options,
+    codec: Rc<dyn Codec>,
     commands: mpsc::Receiver<Command>,
     lifecycle: mpsc::UnboundedReceiver<LifecycleCommand>,
     protocol: Protocol,
@@ -734,6 +749,7 @@ impl DriverState {
         connector: Rc<dyn Connector>,
         timer: Rc<dyn Timer>,
         options: Options,
+        codec: Rc<dyn Codec>,
         commands: mpsc::Receiver<Command>,
         lifecycle: mpsc::UnboundedReceiver<LifecycleCommand>,
         socket_status: Rc<ObservableStatus<SocketStatus>>,
@@ -742,6 +758,7 @@ impl DriverState {
             connector,
             timer,
             options,
+            codec,
             commands,
             lifecycle,
             protocol: Protocol::new(),
@@ -1185,7 +1202,7 @@ impl DriverState {
                     channel.status.set(ChannelStatus::Left);
                 }
                 self.stop_channel(&topic);
-                let _ = response.send(Ok(json!({})));
+                let _ = response.send(Ok(json!({}).into()));
             }
             Command::Shutdown { response } => {
                 let _ = response.send(());
@@ -1249,7 +1266,7 @@ impl DriverState {
                     channel.desired = true;
                     if joined {
                         channel.status.set(ChannelStatus::Joined);
-                        let _ = response.send(Ok(json!({})));
+                        let _ = response.send(Ok(json!({}).into()));
                     } else {
                         channel.status.set(ChannelStatus::WaitingToJoin);
                         channel.join_waiters.insert(id, response);
@@ -1340,10 +1357,10 @@ impl DriverState {
                             response: Some(response),
                         });
                     } else {
-                        let _ = response.send(Ok(json!({})));
+                        let _ = response.send(Ok(json!({}).into()));
                     }
                 } else {
-                    let _ = response.send(Ok(json!({})));
+                    let _ = response.send(Ok(json!({}).into()));
                 }
             }
             Command::Shutdown { .. } => unreachable!("handled by run_connected"),
@@ -1507,12 +1524,9 @@ impl DriverState {
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
         heartbeat_reference: &mut Option<String>,
     ) -> Result<(), DisconnectReason> {
-        let WireMessage::Text(text) = message else {
-            return Err(DisconnectReason::Protocol(
-                "Phoenix binary serializer is not implemented".into(),
-            ));
-        };
-        let frame = Frame::decode_text(&text)
+        let frame = self
+            .codec
+            .decode(message)
             .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
         let event = self
             .protocol
@@ -1573,7 +1587,7 @@ impl DriverState {
                     channel.status.set(ChannelStatus::Errored);
                     if let Some(pending) = channel.deferred_leave.take() {
                         if let Some(response) = pending.response {
-                            let _ = response.send(Ok(json!({})));
+                            let _ = response.send(Ok(json!({}).into()));
                         }
                         channel.status.set(ChannelStatus::Left);
                     }
@@ -1845,11 +1859,12 @@ impl DriverState {
         transport: &mut Box<dyn Transport>,
         frame: Frame,
     ) -> Result<(), DisconnectReason> {
-        let text = frame
-            .encode_text()
+        let message = self
+            .codec
+            .encode(&frame)
             .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
         transport
-            .send(WireMessage::Text(text))
+            .send(message)
             .await
             .map_err(DisconnectReason::Transport)
     }

@@ -11,6 +11,11 @@ defmodule PhoenixChannelFixture.RoomChannel do
   @impl true
   def handle_in("echo", payload, socket), do: {:reply, {:ok, payload}, socket}
 
+  def handle_in("binary", {:binary, payload}, socket) do
+    reversed = payload |> :binary.bin_to_list() |> Enum.reverse() |> :binary.list_to_bin()
+    {:reply, {:ok, {:binary, reversed}}, socket}
+  end
+
   def handle_in("broadcast", payload, socket) do
     broadcast!(socket, "broadcast", Map.put(payload, "sender", socket.assigns.name))
     {:reply, {:ok, %{"sent" => true}}, socket}

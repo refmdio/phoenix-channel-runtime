@@ -14,6 +14,7 @@ use phoenix_channel_client::{
     Channel, ChannelEvent, ChannelStatus, ClientError, ConnectContext, ConnectionConfig, Endpoint,
     EndpointError, JoinContext, Options, Reply, Socket, SocketEvent, SocketStatus,
 };
+use phoenix_channel_runtime::Payload;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -413,7 +414,7 @@ impl NativeChannel {
         }
     }
 
-    pub async fn join(&self) -> Result<Value, NativeRuntimeError> {
+    pub async fn join(&self) -> Result<Payload, NativeRuntimeError> {
         self.request(|response| HostCommand::Join {
             id: self.inner.id,
             response,
@@ -424,12 +425,12 @@ impl NativeChannel {
     pub async fn call(
         &self,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<Reply, NativeRuntimeError> {
         self.request(|response| HostCommand::Call {
             id: self.inner.id,
             event: event.into(),
-            payload,
+            payload: payload.into(),
             response,
         })
         .await
@@ -438,18 +439,18 @@ impl NativeChannel {
     pub async fn cast(
         &self,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<(), NativeRuntimeError> {
         self.request(|response| HostCommand::Cast {
             id: self.inner.id,
             event: event.into(),
-            payload,
+            payload: payload.into(),
             response,
         })
         .await
     }
 
-    pub async fn leave(&self) -> Result<Value, NativeRuntimeError> {
+    pub async fn leave(&self) -> Result<Payload, NativeRuntimeError> {
         self.request(|response| HostCommand::Leave {
             id: self.inner.id,
             response,
@@ -537,23 +538,23 @@ enum HostCommand {
     },
     Join {
         id: u64,
-        response: oneshot::Sender<Result<Value, ClientError>>,
+        response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Call {
         id: u64,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
         id: u64,
         event: String,
-        payload: Value,
+        payload: Payload,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Leave {
         id: u64,
-        response: oneshot::Sender<Result<Value, ClientError>>,
+        response: oneshot::Sender<Result<Payload, ClientError>>,
     },
 }
 

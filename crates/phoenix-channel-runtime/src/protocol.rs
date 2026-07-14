@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::Frame;
+use crate::{Frame, Payload};
 
 const PHOENIX_TOPIC: &str = "phoenix";
 
@@ -34,33 +34,33 @@ pub enum ProtocolEvent {
     Joined {
         topic: String,
         reference: String,
-        response: Value,
+        response: Payload,
     },
     JoinError {
         topic: String,
         reference: String,
-        response: Value,
+        response: Payload,
     },
     Left {
         topic: String,
         reference: String,
-        response: Value,
+        response: Payload,
     },
     Reply {
         topic: String,
         event: String,
         reference: String,
         status: ReplyStatus,
-        response: Value,
+        response: Payload,
     },
     Message(Frame),
     ChannelClosed {
         topic: String,
-        payload: Value,
+        payload: Payload,
     },
     ChannelError {
         topic: String,
-        payload: Value,
+        payload: Payload,
     },
     HeartbeatAck {
         reference: String,
@@ -224,7 +224,7 @@ impl Protocol {
         &mut self,
         topic: &str,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<Outbound, ProtocolError> {
         let event = event.into();
         let join_ref = self
@@ -261,7 +261,7 @@ impl Protocol {
         &self,
         topic: &str,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<Frame, ProtocolError> {
         let join_ref = self
             .channels
@@ -446,17 +446,29 @@ impl Protocol {
     }
 }
 
-fn decode_reply_payload(payload: &Value) -> Result<(ReplyStatus, Value), ProtocolError> {
-    let object = payload
-        .as_object()
-        .ok_or(ProtocolError::InvalidReplyPayload)?;
-    let status = match object.get("status").and_then(Value::as_str) {
-        Some("ok") => ReplyStatus::Ok,
-        Some("error") => ReplyStatus::Error,
-        _ => return Err(ProtocolError::InvalidReplyStatus),
-    };
-    let response = object.get("response").cloned().unwrap_or_else(|| json!({}));
-    Ok((status, response))
+fn decode_reply_payload(payload: &Payload) -> Result<(ReplyStatus, Payload), ProtocolError> {
+    match payload {
+        Payload::Json(value) => {
+            let object = value
+                .as_object()
+                .ok_or(ProtocolError::InvalidReplyPayload)?;
+            let status = decode_reply_status(object.get("status").and_then(Value::as_str))?;
+            let response = object.get("response").cloned().unwrap_or_else(|| json!({}));
+            Ok((status, Payload::Json(response)))
+        }
+        Payload::Reply { status, response } => {
+            Ok((decode_reply_status(Some(status))?, (**response).clone()))
+        }
+        Payload::Binary(_) => Err(ProtocolError::InvalidReplyPayload),
+    }
+}
+
+fn decode_reply_status(status: Option<&str>) -> Result<ReplyStatus, ProtocolError> {
+    match status {
+        Some("ok") => Ok(ReplyStatus::Ok),
+        Some("error") => Ok(ReplyStatus::Error),
+        _ => Err(ProtocolError::InvalidReplyStatus),
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -520,7 +532,7 @@ mod tests {
             ProtocolEvent::Joined {
                 topic: "room:lobby".into(),
                 reference: outbound.reference,
-                response: json!({"ready": true}),
+                response: json!({"ready": true}).into(),
             }
         );
         assert_eq!(
@@ -556,7 +568,7 @@ mod tests {
                 event: "new_message".into(),
                 reference: push.reference,
                 status: ReplyStatus::Ok,
-                response: json!({"id": 99}),
+                response: json!({"id": 99}).into(),
             }
         );
     }

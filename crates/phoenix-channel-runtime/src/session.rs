@@ -4,8 +4,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    Frame, FrameCodecError, Protocol, ProtocolError, ProtocolEvent, Transport, TransportError,
-    TransportEvent, WireMessage,
+    Codec, CodecError, Frame, Payload, PhoenixV2Codec, Protocol, ProtocolError, ProtocolEvent,
+    Transport, TransportError, TransportEvent,
 };
 
 /// A sequential, runtime-neutral Phoenix Channels session.
@@ -17,14 +17,20 @@ use crate::{
 pub struct Session<T> {
     protocol: Protocol,
     transport: T,
+    codec: Box<dyn Codec>,
     buffered_events: VecDeque<ProtocolEvent>,
 }
 
 impl<T: Transport> Session<T> {
     pub fn new(transport: T) -> Self {
+        Self::with_codec(transport, PhoenixV2Codec)
+    }
+
+    pub fn with_codec(transport: T, codec: impl Codec + 'static) -> Self {
         Self {
             protocol: Protocol::new(),
             transport,
+            codec: Box::new(codec),
             buffered_events: VecDeque::new(),
         }
     }
@@ -71,7 +77,7 @@ impl<T: Transport> Session<T> {
         &mut self,
         topic: &str,
         event: impl Into<String>,
-        payload: Value,
+        payload: impl Into<Payload>,
     ) -> Result<ProtocolEvent, SessionError> {
         let outbound = self.protocol.push(topic, event, payload)?;
         let reference = outbound.reference.clone();
@@ -113,9 +119,7 @@ impl<T: Transport> Session<T> {
     }
 
     async fn send(&mut self, frame: Frame) -> Result<(), SessionError> {
-        self.transport
-            .send(WireMessage::Text(frame.encode_text()?))
-            .await?;
+        self.transport.send(self.codec.encode(&frame)?).await?;
         Ok(())
     }
 
@@ -137,11 +141,7 @@ impl<T: Transport> Session<T> {
             TransportEvent::Message(message) => message,
             TransportEvent::Closed(close) => return Err(SessionError::ConnectionClosed(close)),
         };
-        let text = match message {
-            WireMessage::Text(text) => text,
-            WireMessage::Binary(_) => return Err(SessionError::BinarySerializerNotImplemented),
-        };
-        Ok(self.protocol.receive(Frame::decode_text(&text)?)?)
+        Ok(self.protocol.receive(self.codec.decode(message)?)?)
     }
 }
 
@@ -166,13 +166,11 @@ pub enum SessionError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
-    Codec(#[from] FrameCodecError),
+    Codec(#[from] CodecError),
     #[error(transparent)]
     Transport(#[from] TransportError),
     #[error("WebSocket connection closed: {0:?}")]
     ConnectionClosed(crate::TransportClose),
-    #[error("Phoenix binary serializer is not implemented")]
-    BinarySerializerNotImplemented,
 }
 
 #[cfg(test)]
@@ -183,6 +181,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::WireMessage;
 
     #[derive(Default)]
     struct MockState {

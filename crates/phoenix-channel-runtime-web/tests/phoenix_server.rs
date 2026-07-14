@@ -3,7 +3,7 @@
 use phoenix_channel_client::{
     ChannelEvent, ConnectionConfig, Endpoint, Options, Socket, SocketEvent, static_join_payload,
 };
-use phoenix_channel_runtime::{ProtocolEvent, ReplyStatus};
+use phoenix_channel_runtime::{Payload, ProtocolEvent, ReplyStatus};
 use phoenix_channel_runtime_web::{WebConnector, WebTimer};
 use serde_json::json;
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -54,6 +54,12 @@ async fn interoperates_with_a_real_phoenix_server() {
         .expect("call should succeed");
     assert_eq!(reply.status, ReplyStatus::Ok);
     assert_eq!(reply.response, json!({"value": 42}));
+
+    let reply = channel
+        .call("binary", vec![1, 2, 3, 4])
+        .await
+        .expect("binary call should succeed");
+    assert_eq!(reply.response, Payload::Binary(vec![4, 3, 2, 1]));
 
     let reply = channel
         .call("broadcast", json!({"value": "hello"}))

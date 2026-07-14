@@ -19,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let channel = socket.channel(topic.clone(), static_join_payload(json!({})))?;
             let response = channel.join().await?;
-            println!("joined {topic}: {response}");
+            println!("joined {topic}: {response:?}");
             socket.shutdown().await?;
             Ok(())
         })
