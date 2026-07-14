@@ -286,6 +286,28 @@ impl Protocol {
         }
     }
 
+    /// Removes all local state associated with a topic.
+    ///
+    /// This is used when a channel handle is dropped. Any later replies for
+    /// the removed join generation are treated as unmatched messages.
+    pub fn discard_channel(&mut self, topic: &str) -> bool {
+        let removed = self.channels.remove(topic).is_some();
+        self.pending.retain(|_, pending| match pending {
+            Pending::Join {
+                topic: pending_topic,
+            }
+            | Pending::Leave {
+                topic: pending_topic,
+            }
+            | Pending::Push {
+                topic: pending_topic,
+                ..
+            } => pending_topic != topic,
+            Pending::Heartbeat => true,
+        });
+        removed
+    }
+
     pub fn heartbeat(&mut self) -> Outbound {
         let reference = self.allocate_reference();
         self.pending.insert(reference.clone(), Pending::Heartbeat);
