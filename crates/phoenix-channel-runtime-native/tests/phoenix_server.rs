@@ -12,7 +12,7 @@ use phoenix_channel_client::{
     ChannelEvent, ConnectionConfig, Endpoint, Options, Socket, SocketEvent, static_join_payload,
 };
 use phoenix_channel_runtime::{ProtocolEvent, ReplyStatus};
-use phoenix_channel_runtime_native::{NativeConnector, NativeTimer};
+use phoenix_channel_runtime_native::{NativeConnector, NativeSocket, NativeTimer};
 use serde_json::json;
 
 struct PhoenixServer(Child);
@@ -146,4 +146,50 @@ async fn interoperates_with_a_real_phoenix_server() {
             socket.shutdown().await.expect("shutdown should succeed");
         })
         .await;
+
+    let socket = NativeSocket::spawn(
+        format!("ws://127.0.0.1:{port}/socket"),
+        ConnectionConfig::default()
+            .param("client", "rust")
+            .auth_token("secret"),
+    )
+    .expect("native worker should start");
+    socket
+        .connect()
+        .await
+        .expect("native socket should connect");
+    let channel = socket
+        .channel("room:threaded", json!({"name": "threaded"}))
+        .await
+        .expect("native channel should be created");
+    assert_eq!(
+        channel.join().await.expect("native join should succeed"),
+        json!({"name": "threaded", "room": "threaded"})
+    );
+
+    let channel_from_another_task = channel.clone();
+    let reply = tokio::spawn(async move {
+        channel_from_another_task
+            .call("echo", json!({"from": "tokio task"}))
+            .await
+    })
+    .await
+    .expect("Send channel task should complete")
+    .expect("native call should succeed");
+    assert_eq!(reply.response, json!({"from": "tokio task"}));
+
+    socket
+        .disconnect()
+        .await
+        .expect("native socket should disconnect");
+    socket
+        .connect()
+        .await
+        .expect("native socket should reconnect");
+    let reply = channel
+        .call("echo", json!({"after": "reconnect"}))
+        .await
+        .expect("native channel should rejoin");
+    assert_eq!(reply.response, json!({"after": "reconnect"}));
+    socket.shutdown().await.expect("native worker should stop");
 }

@@ -187,8 +187,51 @@ fn stops_after_a_clean_transport_close() {
                 ),
             })
         );
+        assert_eq!(socket.status(), SocketStatus::Disconnected);
+        socket.shutdown().await.unwrap();
         assert_eq!(events.next().await, Some(SocketEvent::Closed));
         assert_eq!(socket.status(), SocketStatus::Closed);
+    });
+}
+
+#[test]
+fn explicitly_connects_disconnects_and_connects_again() {
+    let (first, _first_peer) = connection();
+    let (second, _second_peer) = connection();
+    let connector = connector([first, second]);
+    let (timer, _timer_requests) = timer();
+    let options = Options::default().connect_on_start(false);
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    let mut events = socket.events().unwrap();
+    assert_eq!(socket.status(), SocketStatus::Disconnected);
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        socket.connect().await.unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::Connecting { attempt: 0 })
+        );
+        assert_eq!(events.next().await, Some(SocketEvent::Connected));
+
+        socket.disconnect().await.unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::Disconnected {
+                reason: DisconnectReason::Requested,
+            })
+        );
+        assert_eq!(socket.status(), SocketStatus::Disconnected);
+
+        socket.connect().await.unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::Connecting { attempt: 0 })
+        );
+        assert_eq!(events.next().await, Some(SocketEvent::Connected));
+        socket.shutdown().await.unwrap();
+        assert_eq!(events.next().await, Some(SocketEvent::Closed));
     });
 }
 

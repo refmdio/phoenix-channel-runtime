@@ -47,6 +47,8 @@ pub enum SocketEvent {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DisconnectReason {
+    #[error("connection closed by request")]
+    Requested,
     #[error("connection failed: {0}")]
     Connect(TransportError),
     #[error("transport failed: {0}")]
@@ -65,7 +67,7 @@ impl DisconnectReason {
     fn should_reconnect(&self) -> bool {
         match self {
             Self::Closed(close) => close.should_reconnect(),
-            Self::DriverStopped => false,
+            Self::Requested | Self::DriverStopped => false,
             Self::Connect(_) | Self::Transport(_) | Self::HeartbeatTimeout | Self::Protocol(_) => {
                 true
             }
@@ -75,6 +77,7 @@ impl DisconnectReason {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketStatus {
+    Disconnected,
     Connecting,
     Connected,
     WaitingToReconnect,
@@ -148,7 +151,11 @@ impl Socket {
         let (commands, command_rx) = mpsc::channel(options.command_capacity);
         let (lifecycle, lifecycle_rx) = mpsc::unbounded();
         let timer: Rc<dyn Timer> = Rc::new(timer);
-        let status = Rc::new(Cell::new(SocketStatus::Connecting));
+        let status = Rc::new(Cell::new(if options.connect_on_start {
+            SocketStatus::Connecting
+        } else {
+            SocketStatus::Disconnected
+        }));
         let socket = Self {
             commands,
             lifecycle: lifecycle.clone(),
@@ -220,6 +227,26 @@ impl Socket {
 
     pub fn status(&self) -> SocketStatus {
         self.status.get()
+    }
+
+    pub async fn connect(&self) -> Result<(), ClientError> {
+        let (response, receiver) = oneshot::channel();
+        let mut commands = self.commands.clone();
+        commands
+            .send(Command::Connect { response })
+            .await
+            .map_err(|_| ClientError::DriverStopped)?;
+        receiver.await.map_err(|_| ClientError::DriverStopped)
+    }
+
+    pub async fn disconnect(&self) -> Result<(), ClientError> {
+        let (response, receiver) = oneshot::channel();
+        let mut commands = self.commands.clone();
+        commands
+            .send(Command::Disconnect { response })
+            .await
+            .map_err(|_| ClientError::DriverStopped)?;
+        receiver.await.map_err(|_| ClientError::DriverStopped)
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
@@ -453,6 +480,12 @@ enum LifecycleCommand {
 }
 
 enum Command {
+    Connect {
+        response: oneshot::Sender<()>,
+    },
+    Disconnect {
+        response: oneshot::Sender<()>,
+    },
     Subscribe {
         events: mpsc::UnboundedSender<SocketEvent>,
     },
@@ -601,8 +634,24 @@ impl DriverState {
     }
 
     async fn run(mut self) {
+        let mut connection_enabled = self.options.connect_on_start;
         let mut attempt = 0;
         loop {
+            if !connection_enabled {
+                match self.wait_idle().await {
+                    IdleExit::Connect(response) => {
+                        let _ = response.send(());
+                        connection_enabled = true;
+                        attempt = 0;
+                    }
+                    IdleExit::Shutdown(response) => {
+                        let _ = response.send(());
+                        self.emit_socket(SocketEvent::Closed);
+                        return;
+                    }
+                }
+            }
+
             self.emit_socket(SocketEvent::Connecting { attempt });
             let connection = self.connector.connect(ConnectContext { attempt }).fuse();
             let connect_timeout = self.timer.sleep(self.options.connect_timeout).fuse();
@@ -616,13 +665,24 @@ impl DriverState {
                         Some(command) => self.handle_offline_lifecycle(command),
                         None => break None,
                     },
-                    result = connection => break Some(result),
-                    () = connect_timeout => break Some(Err(TransportError::with_kind(
+                    result = connection => break Some(ConnectAttemptExit::Connected(result)),
+                    () = connect_timeout => break Some(ConnectAttemptExit::Connected(Err(TransportError::with_kind(
                         TransportErrorKind::Connect,
                         format!("connection attempt timed out after {:?}", self.options.connect_timeout),
-                    ))),
+                    )))),
                     command = command => match command {
-                        Some(command) => if self.handle_offline_command(command) { break None },
+                        Some(Command::Connect { response }) => {
+                            let _ = response.send(());
+                        }
+                        Some(Command::Disconnect { response }) => {
+                            break Some(ConnectAttemptExit::Disconnect(response));
+                        }
+                        Some(Command::Shutdown { response }) => {
+                            break Some(ConnectAttemptExit::Shutdown(response));
+                        }
+                        Some(command) => {
+                            self.handle_offline_command(command);
+                        }
                         None => break None,
                     }
                 }
@@ -633,7 +693,7 @@ impl DriverState {
             };
 
             match connected {
-                Ok(mut transport) => {
+                ConnectAttemptExit::Connected(Ok(mut transport)) => {
                     attempt = 0;
                     self.emit_socket(SocketEvent::Connected);
                     match self.run_connected(&mut transport).await {
@@ -643,34 +703,86 @@ impl DriverState {
                             self.emit_socket(SocketEvent::Closed);
                             return;
                         }
+                        ConnectedExit::Disconnect(response) => {
+                            let _ = transport.close().await;
+                            self.on_disconnect(&DisconnectReason::Requested);
+                            let _ = response.send(());
+                            connection_enabled = false;
+                            continue;
+                        }
                         ConnectedExit::Disconnected(reason) => {
                             let _ = transport.close().await;
                             self.on_disconnect(&reason);
                             if !reason.should_reconnect() {
-                                self.emit_socket(SocketEvent::Closed);
-                                return;
+                                connection_enabled = false;
+                                continue;
                             }
                         }
                     }
                 }
-                Err(error) => {
+                ConnectAttemptExit::Connected(Err(error)) => {
                     self.emit_socket(SocketEvent::Disconnected {
                         reason: DisconnectReason::Connect(error),
                     });
+                }
+                ConnectAttemptExit::Disconnect(response) => {
+                    self.on_disconnect(&DisconnectReason::Requested);
+                    let _ = response.send(());
+                    connection_enabled = false;
+                    continue;
+                }
+                ConnectAttemptExit::Shutdown(response) => {
+                    let _ = response.send(());
+                    self.emit_socket(SocketEvent::Closed);
+                    return;
                 }
             }
 
             attempt = attempt.saturating_add(1);
             let delay = (self.options.reconnect_delay)(attempt);
             self.emit_socket(SocketEvent::ReconnectScheduled { attempt, delay });
-            if self.wait_offline(delay).await {
-                self.emit_socket(SocketEvent::Closed);
-                return;
+            match self.wait_offline(delay).await {
+                OfflineExit::Retry => {}
+                OfflineExit::Disconnect(response) => {
+                    self.on_disconnect(&DisconnectReason::Requested);
+                    let _ = response.send(());
+                    connection_enabled = false;
+                }
+                OfflineExit::Shutdown(response) => {
+                    let _ = response.send(());
+                    self.emit_socket(SocketEvent::Closed);
+                    return;
+                }
             }
         }
     }
 
-    async fn wait_offline(&mut self, delay: Duration) -> bool {
+    async fn wait_idle(&mut self) -> IdleExit {
+        loop {
+            let lifecycle = self.lifecycle.next().fuse();
+            let command = self.commands.next().fuse();
+            futures::pin_mut!(lifecycle, command);
+            futures::select_biased! {
+                lifecycle = lifecycle => match lifecycle {
+                    Some(command) => self.handle_offline_lifecycle(command),
+                    None => return IdleExit::Shutdown(closed_response()),
+                },
+                command = command => match command {
+                    Some(Command::Connect { response }) => return IdleExit::Connect(response),
+                    Some(Command::Disconnect { response }) => {
+                        let _ = response.send(());
+                    }
+                    Some(Command::Shutdown { response }) => return IdleExit::Shutdown(response),
+                    Some(command) => {
+                        self.handle_offline_command(command);
+                    }
+                    None => return IdleExit::Shutdown(closed_response()),
+                }
+            }
+        }
+    }
+
+    async fn wait_offline(&mut self, delay: Duration) -> OfflineExit {
         let sleep = self.timer.sleep(delay).fuse();
         futures::pin_mut!(sleep);
         loop {
@@ -680,12 +792,21 @@ impl DriverState {
             futures::select_biased! {
                 lifecycle = lifecycle => match lifecycle {
                     Some(command) => self.handle_offline_lifecycle(command),
-                    None => return true,
+                    None => return OfflineExit::Shutdown(closed_response()),
                 },
-                () = sleep => return false,
+                () = sleep => return OfflineExit::Retry,
                 command = command => match command {
-                    Some(command) => if self.handle_offline_command(command) { return true },
-                    None => return true,
+                    Some(Command::Connect { response }) => {
+                        let _ = response.send(());
+                    }
+                    Some(Command::Disconnect { response }) => {
+                        return OfflineExit::Disconnect(response);
+                    }
+                    Some(Command::Shutdown { response }) => return OfflineExit::Shutdown(response),
+                    Some(command) => {
+                        self.handle_offline_command(command);
+                    }
+                    None => return OfflineExit::Shutdown(closed_response()),
                 }
             }
         }
@@ -782,6 +903,13 @@ impl DriverState {
                 Action::Command(Some(Command::Shutdown { response })) => {
                     return ConnectedExit::Shutdown(response);
                 }
+                Action::Command(Some(Command::Disconnect { response })) => {
+                    return ConnectedExit::Disconnect(response);
+                }
+                Action::Command(Some(Command::Connect { response })) => {
+                    let _ = response.send(());
+                    Ok(())
+                }
                 Action::Command(Some(command)) => {
                     self.handle_connected_command(
                         command,
@@ -877,6 +1005,9 @@ impl DriverState {
 
     fn handle_offline_command(&mut self, command: Command) -> bool {
         match command {
+            Command::Connect { .. } | Command::Disconnect { .. } => {
+                unreachable!("connection controls are handled by the driver loop")
+            }
             Command::Subscribe { events } => self.socket_subscribers.push(events),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
             Command::Join {
@@ -1092,6 +1223,9 @@ impl DriverState {
                 }
             }
             Command::Shutdown { .. } => unreachable!("handled by run_connected"),
+            Command::Connect { .. } | Command::Disconnect { .. } => {
+                unreachable!("connection controls are handled by run_connected")
+            }
         }
         Ok(())
     }
@@ -1668,6 +1802,9 @@ impl DriverState {
         let status = match &event {
             SocketEvent::Connecting { .. } => SocketStatus::Connecting,
             SocketEvent::Connected => SocketStatus::Connected,
+            SocketEvent::Disconnected { reason } if !reason.should_reconnect() => {
+                SocketStatus::Disconnected
+            }
             SocketEvent::Disconnected { .. } | SocketEvent::ReconnectScheduled { .. } => {
                 SocketStatus::WaitingToReconnect
             }
@@ -1694,7 +1831,31 @@ impl DriverState {
 
 enum ConnectedExit {
     Shutdown(oneshot::Sender<()>),
+    Disconnect(oneshot::Sender<()>),
     Disconnected(DisconnectReason),
+}
+
+enum ConnectAttemptExit {
+    Connected(Result<Box<dyn Transport>, TransportError>),
+    Disconnect(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+enum OfflineExit {
+    Retry,
+    Disconnect(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+enum IdleExit {
+    Connect(oneshot::Sender<()>),
+    Shutdown(oneshot::Sender<()>),
+}
+
+fn closed_response() -> oneshot::Sender<()> {
+    let (response, receiver) = oneshot::channel();
+    drop(receiver);
+    response
 }
 
 #[cfg(test)]

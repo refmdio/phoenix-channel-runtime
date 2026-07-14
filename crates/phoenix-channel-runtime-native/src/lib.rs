@@ -208,4 +208,10 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+mod managed;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::{NativeConnector, NativeTimer, NativeTransport};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use managed::*;

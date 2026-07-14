@@ -48,6 +48,7 @@ pub struct Options {
     pub(crate) rejoin_delay: Rc<dyn Fn(u32) -> Duration>,
     pub(crate) command_capacity: usize,
     pub(crate) push_buffer_capacity: usize,
+    pub(crate) connect_on_start: bool,
 }
 
 impl Default for Options {
@@ -61,6 +62,7 @@ impl Default for Options {
             rejoin_delay: Rc::new(default_retry_delay),
             command_capacity: 64,
             push_buffer_capacity: 64,
+            connect_on_start: true,
         }
     }
 }
@@ -103,6 +105,11 @@ impl Options {
 
     pub fn push_buffer_capacity(mut self, capacity: usize) -> Self {
         self.push_buffer_capacity = capacity;
+        self
+    }
+
+    pub fn connect_on_start(mut self, enabled: bool) -> Self {
+        self.connect_on_start = enabled;
         self
     }
 }
