@@ -10,21 +10,46 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.85.0", stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy,rustfmt
+      - run: cargo fmt --all -- --check
+      - if: matrix.rust == 'stable'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  wasm:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy,rustfmt
           targets: wasm32-unknown-unknown
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
       - run: cargo check -p phoenix-channel-runtime --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-client --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-runtime-web --target wasm32-unknown-unknown
 
+  fuzz-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - run: cargo fuzz build codec
+
   phoenix-e2e:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        phoenix: ["~> 1.7.0", "~> 1.8.0"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,14 +57,38 @@ jobs:
         with:
           otp-version: "28"
           elixir-version: "1.19"
+      - run: mix deps.unlock --all
+        working-directory: tests/fixtures/phoenix_server
+        env:
+          PHOENIX_VERSION: ${{ matrix.phoenix }}
       - run: mix deps.get
         working-directory: tests/fixtures/phoenix_server
+        env:
+          PHOENIX_VERSION: ${{ matrix.phoenix }}
       - run: cargo test -p phoenix-channel-runtime-native --test phoenix_server
         env:
           PHOENIX_E2E: "1"
+
+  browser-e2e:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chrome, firefox]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+      - run: mix deps.get
+        working-directory: tests/fixtures/phoenix_server
       - run: mix run --no-halt > /tmp/phoenix-channel-fixture.log 2>&1 &
         working-directory: tests/fixtures/phoenix_server
         env:
           PORT: "4056"
       - run: cargo install wasm-pack --locked --version 0.13.1
-      - run: wasm-pack test --headless --chrome crates/phoenix-channel-runtime-web
+      - run: wasm-pack test --headless --${{ matrix.browser }} crates/phoenix-channel-runtime-web

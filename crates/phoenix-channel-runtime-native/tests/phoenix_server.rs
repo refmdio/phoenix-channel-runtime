@@ -19,8 +19,12 @@ struct PhoenixServer(Child);
 
 impl PhoenixServer {
     fn start(port: u16) -> Self {
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/phoenix_server");
+        let fixture = std::env::var_os("PHOENIX_FIXTURE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../tests/fixtures/phoenix_server")
+            });
         let child = Command::new("mix")
             .args(["run", "--no-halt"])
             .current_dir(fixture)
@@ -65,13 +69,15 @@ async fn interoperates_with_a_real_phoenix_server() {
 
     let port = available_port();
     let _server = PhoenixServer::start(port);
+    let mut connection_config = ConnectionConfig::default()
+        .param("client", "rust")
+        .param("token", "secret");
+    if !std::env::var("PHOENIX_VERSION").is_ok_and(|version| version.contains("1.7")) {
+        connection_config = connection_config.auth_token("secret");
+    }
     let endpoint = Endpoint::new(format!("ws://127.0.0.1:{port}/socket"))
         .expect("endpoint should be valid")
-        .connection_config(
-            ConnectionConfig::default()
-                .param("client", "rust")
-                .auth_token("secret"),
-        );
+        .connection_config(connection_config.clone());
 
     tokio::task::LocalSet::new()
         .run_until(async move {
@@ -153,13 +159,8 @@ async fn interoperates_with_a_real_phoenix_server() {
         })
         .await;
 
-    let socket = NativeSocket::spawn(
-        format!("ws://127.0.0.1:{port}/socket"),
-        ConnectionConfig::default()
-            .param("client", "rust")
-            .auth_token("secret"),
-    )
-    .expect("native worker should start");
+    let socket = NativeSocket::spawn(format!("ws://127.0.0.1:{port}/socket"), connection_config)
+        .expect("native worker should start");
     socket
         .connect()
         .await

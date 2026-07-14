@@ -20,6 +20,7 @@ async fn interoperates_with_a_real_phoenix_server() {
         .connection_config(
             ConnectionConfig::default()
                 .param("client", "rust")
+                .param("token", "secret")
                 .auth_token("secret"),
         );
     let (socket, driver) = Socket::new(

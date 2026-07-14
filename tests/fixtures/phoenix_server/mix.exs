@@ -22,7 +22,7 @@ defmodule PhoenixChannelFixture.MixProject do
     [
       {:bandit, "~> 1.7"},
       {:jason, "~> 1.4"},
-      {:phoenix, "~> 1.8.0"}
+      {:phoenix, System.get_env("PHOENIX_VERSION", "~> 1.8.0")}
     ]
   end
 end
