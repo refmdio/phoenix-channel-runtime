@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Rust documentation for Phoenix Channel Runtime">
+    <title>Phoenix Channel Runtime</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        background: Canvas;
+        color: CanvasText;
+      }
+
+      body {
+        max-width: 52rem;
+        margin: 0 auto;
+        padding: 4rem 1.5rem;
+        line-height: 1.6;
+      }
+
+      h1 {
+        margin-bottom: 0.5rem;
+      }
+
+      p {
+        color: GrayText;
+      }
+
+      ul {
+        display: grid;
+        gap: 0.75rem;
+        padding: 0;
+        list-style: none;
+      }
+
+      a {
+        display: block;
+        padding: 1rem 1.25rem;
+        border: 1px solid ButtonBorder;
+        border-radius: 0.5rem;
+        color: LinkText;
+        text-decoration: none;
+      }
+
+      a:hover {
+        background: ButtonFace;
+      }
+
+      strong {
+        display: block;
+        color: CanvasText;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Phoenix Channel Runtime</h1>
+      <p>Rust APIs for Phoenix Channels v2 on native and browser targets.</p>
+      <ul>
+        <li>
+          <a href="native/phoenix_channel_client/">
+            <strong>Managed client</strong>
+            Sockets, channels, reconnects, Presence, and telemetry
+          </a>
+        </li>
+        <li>
+          <a href="native/phoenix_channel_runtime_native/">
+            <strong>Native runtime</strong>
+            Tokio WebSocket transport and Send + Sync worker handles
+          </a>
+        </li>
+        <li>
+          <a href="web/phoenix_channel_runtime_web/">
+            <strong>Browser runtime</strong>
+            WebSocket, LongPoll fallback, and browser lifecycle integration
+          </a>
+        </li>
+        <li>
+          <a href="native/phoenix_channel_runtime/">
+            <strong>Protocol runtime</strong>
+            Phoenix v2 codecs, state machine, sessions, and Presence sync
+          </a>
+        </li>
+      </ul>
+    </main>
+  </body>
+</html>
