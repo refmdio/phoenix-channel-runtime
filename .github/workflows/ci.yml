@@ -87,6 +87,7 @@ jobs:
 
   browser-e2e:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +116,4 @@ jobs:
       - run: cargo install wasm-pack --locked --version 0.13.1
       - if: matrix.browser == 'safari'
         run: sudo safaridriver --enable
-      - if: matrix.browser != 'safari'
-        run: wasm-pack test --headless --${{ matrix.browser }} crates/phoenix-channel-runtime-web
-      - if: matrix.browser == 'safari'
-        run: wasm-pack test --safari crates/phoenix-channel-runtime-web
+      - run: wasm-pack test --headless --${{ matrix.browser }} crates/phoenix-channel-runtime-web
