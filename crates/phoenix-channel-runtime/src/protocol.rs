@@ -162,7 +162,7 @@ impl Protocol {
         let topic = topic.into();
         match self.channels.get(&topic).map(|channel| channel.state) {
             Some(ChannelState::Disconnected | ChannelState::Errored | ChannelState::Closed) => {
-                self.channels.remove(&topic);
+                self.discard_channel(&topic);
                 self.join(topic, refreshed_params)
             }
             Some(_) => Err(ProtocolError::AlreadyActive(topic)),
@@ -324,15 +324,15 @@ impl Protocol {
     }
 
     pub fn receive(&mut self, frame: Frame) -> Result<ProtocolEvent, ProtocolError> {
-        if frame.event == "phx_reply" {
-            return self.receive_reply(frame);
-        }
-
         if let Some(channel) = self.channels.get(&frame.topic)
             && frame.join_ref.is_some()
             && frame.join_ref.as_deref() != Some(channel.join_ref.as_str())
         {
             return Ok(ProtocolEvent::StaleMessage(frame));
+        }
+
+        if frame.event == "phx_reply" {
+            return self.receive_reply(frame);
         }
 
         match frame.event.as_str() {
@@ -609,6 +609,33 @@ mod tests {
         assert_eq!(
             protocol.receive(stale.clone()).unwrap(),
             ProtocolEvent::StaleMessage(stale)
+        );
+    }
+
+    #[test]
+    fn rejects_replies_from_an_old_join_generation() {
+        let mut protocol = joined_protocol();
+        let push = protocol
+            .push("room:lobby", "save", json!({"version": 1}))
+            .unwrap();
+        let channel_error = Frame::new(
+            push.frame.join_ref.clone(),
+            None,
+            "room:lobby",
+            "phx_error",
+            json!({}),
+        );
+        protocol.receive(channel_error).unwrap();
+
+        let rejoin = protocol
+            .rejoin("room:lobby", json!({"token": "refreshed"}))
+            .unwrap();
+        protocol.receive(reply(&rejoin, "ok", json!({}))).unwrap();
+
+        let stale_reply = reply(&push, "ok", json!({"version": 2}));
+        assert_eq!(
+            protocol.receive(stale_reply.clone()).unwrap(),
+            ProtocolEvent::StaleMessage(stale_reply)
         );
     }
 }

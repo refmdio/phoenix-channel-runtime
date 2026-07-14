@@ -284,6 +284,146 @@ fn accepts_heartbeat_acknowledgements() {
 }
 
 #[test]
+fn retries_a_join_after_its_wire_request_times_out() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let request_timeout = Duration::from_millis(31);
+    let rejoin_delay = Duration::from_millis(7);
+    let options = Options::default()
+        .heartbeat_interval(Duration::from_secs(60))
+        .request_timeout(request_timeout)
+        .rejoin_delay(move |_| rejoin_delay);
+
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+    pool.run_until(async move {
+        let mut channel = socket
+            .channel("room:lobby", static_join_payload(json!({})))
+            .unwrap();
+        let id = channel.next_request_id();
+        let (response, joined) = oneshot::channel();
+        channel
+            .send(Command::Join {
+                id,
+                topic: channel.topic.clone(),
+                response,
+            })
+            .await
+            .unwrap();
+
+        let first_join = next_frame(&mut peer).await;
+        assert_eq!(first_join.event, "phx_join");
+
+        let mut held_timers = Vec::new();
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == request_timeout {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == rejoin_delay {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+
+        let second_join = next_frame(&mut peer).await;
+        assert_eq!(second_join.event, "phx_join");
+        assert_ne!(second_join.join_ref, first_join.join_ref);
+        reply(&peer, &second_join, "ok", json!({"attempt": 2}));
+
+        assert_eq!(joined.await.unwrap().unwrap_err(), ClientError::Timeout);
+        loop {
+            if matches!(
+                channel.next_event().await,
+                Some(ChannelEvent::Protocol(ProtocolEvent::Joined { .. }))
+            ) {
+                break;
+            }
+        }
+        assert_eq!(channel.status(), ChannelStatus::Joined);
+        socket.shutdown().await.unwrap();
+        drop(held_timers);
+    });
+}
+
+#[test]
+fn rejoins_after_an_error_while_joining() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let request_timeout = Duration::from_millis(37);
+    let rejoin_delay = Duration::from_millis(11);
+    let options = Options::default()
+        .heartbeat_interval(Duration::from_secs(60))
+        .request_timeout(request_timeout)
+        .rejoin_delay(move |_| rejoin_delay);
+
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:lobby", static_join_payload(json!({})))
+            .unwrap();
+        let id = channel.next_request_id();
+        let (response, joined) = oneshot::channel();
+        channel
+            .send(Command::Join {
+                id,
+                topic: channel.topic.clone(),
+                response,
+            })
+            .await
+            .unwrap();
+
+        let first_join = next_frame(&mut peer).await;
+        let channel_error = Frame::new(
+            first_join.join_ref.clone(),
+            None,
+            first_join.topic.clone(),
+            "phx_error",
+            json!({}),
+        );
+        peer.incoming
+            .as_ref()
+            .unwrap()
+            .unbounded_send(WireMessage::Text(channel_error.encode_text().unwrap()))
+            .unwrap();
+
+        let mut rejoin_timer = None;
+        let mut held_timers = Vec::new();
+        while rejoin_timer.is_none() {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == request_timeout {
+                request.fire.send(()).unwrap();
+            } else if request.duration == rejoin_delay {
+                rejoin_timer = Some(request);
+            } else {
+                held_timers.push(request);
+            }
+        }
+        rejoin_timer.unwrap().fire.send(()).unwrap();
+
+        let second_join = next_frame(&mut peer).await;
+        assert_ne!(second_join.join_ref, first_join.join_ref);
+        reply(&peer, &second_join, "ok", json!({"rejoined": true}));
+
+        assert_eq!(joined.await.unwrap().unwrap(), json!({"rejoined": true}));
+        assert_eq!(channel.status(), ChannelStatus::Joined);
+        socket.shutdown().await.unwrap();
+        drop(held_timers);
+    });
+}
+
+#[test]
 fn times_out_and_removes_an_unsent_call() {
     let (transport, mut peer) = connection();
     let connector = connector([transport]);
@@ -630,5 +770,92 @@ fn queues_a_rejoin_requested_while_leave_is_in_flight() {
         futures::join!(server, client);
         assert_eq!(channel.status(), ChannelStatus::Joined);
         socket.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn continues_a_queued_rejoin_after_leave_times_out() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let request_timeout = Duration::from_millis(41);
+    let options = Options::default()
+        .heartbeat_interval(Duration::from_secs(60))
+        .request_timeout(request_timeout);
+
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:lobby", static_join_payload(json!({})))
+            .unwrap();
+
+        let join_id = channel.next_request_id();
+        let (join_response, joined) = oneshot::channel();
+        channel
+            .send(Command::Join {
+                id: join_id,
+                topic: channel.topic.clone(),
+                response: join_response,
+            })
+            .await
+            .unwrap();
+        let first_join = next_frame(&mut peer).await;
+        reply(&peer, &first_join, "ok", json!({}));
+        joined.await.unwrap().unwrap();
+
+        let mut held_timers = Vec::new();
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == request_timeout {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+
+        let leave_id = channel.next_request_id();
+        let (leave_response, left) = oneshot::channel();
+        channel
+            .send(Command::Leave {
+                id: leave_id,
+                topic: channel.topic.clone(),
+                response: leave_response,
+            })
+            .await
+            .unwrap();
+        let leave = next_frame(&mut peer).await;
+        assert_eq!(leave.event, "phx_leave");
+
+        let rejoin_id = channel.next_request_id();
+        let (rejoin_response, rejoined) = oneshot::channel();
+        channel
+            .send(Command::Join {
+                id: rejoin_id,
+                topic: channel.topic.clone(),
+                response: rejoin_response,
+            })
+            .await
+            .unwrap();
+
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == request_timeout {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+
+        let second_join = next_frame(&mut peer).await;
+        assert_eq!(second_join.event, "phx_join");
+        reply(&peer, &second_join, "ok", json!({"generation": 2}));
+
+        assert_eq!(left.await.unwrap().unwrap_err(), ClientError::Timeout);
+        assert_eq!(rejoined.await.unwrap().unwrap(), json!({"generation": 2}));
+        assert_eq!(channel.status(), ChannelStatus::Joined);
+        socket.shutdown().await.unwrap();
+        drop(held_timers);
     });
 }

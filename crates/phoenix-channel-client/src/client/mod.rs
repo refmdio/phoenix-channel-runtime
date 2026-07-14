@@ -500,6 +500,7 @@ struct ChannelRecord {
     ever_joined: bool,
     active_payload: Option<u64>,
     join_attempt: u32,
+    rejoin_scheduled: bool,
     join_waiters: HashMap<RequestId, oneshot::Sender<Result<Value, ClientError>>>,
     queued: VecDeque<QueuedPush>,
     deferred_leave: Option<PendingLeave>,
@@ -512,10 +513,15 @@ struct PendingCall {
 
 struct PendingLeave {
     id: RequestId,
-    response: oneshot::Sender<Result<Value, ClientError>>,
+    response: Option<oneshot::Sender<Result<Value, ClientError>>>,
 }
 
 type PayloadResult = (String, u64, Result<Value, String>);
+
+enum OperationTimeout {
+    Join { topic: String, reference: String },
+    Leave { topic: String, reference: String },
+}
 
 struct DriverState {
     connector: Rc<dyn Connector>,
@@ -526,6 +532,7 @@ struct DriverState {
     protocol: Protocol,
     channels: HashMap<String, ChannelRecord>,
     socket_subscribers: Vec<mpsc::UnboundedSender<SocketEvent>>,
+    pending_joins: HashMap<String, String>,
     pending_calls: HashMap<String, PendingCall>,
     pending_leaves: HashMap<String, PendingLeave>,
     next_payload_id: u64,
@@ -550,6 +557,7 @@ impl DriverState {
             protocol: Protocol::new(),
             channels: HashMap::new(),
             socket_subscribers: Vec::new(),
+            pending_joins: HashMap::new(),
             pending_calls: HashMap::new(),
             pending_leaves: HashMap::new(),
             next_payload_id: 0,
@@ -644,6 +652,11 @@ impl DriverState {
             FuturesUnordered::new();
         let mut rejoins: FuturesUnordered<LocalBoxFuture<'static, String>> =
             FuturesUnordered::new();
+        let mut operation_timeouts: FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>> =
+            FuturesUnordered::new();
+        for channel in self.channels.values_mut() {
+            channel.rejoin_scheduled = false;
+        }
         let desired = self
             .channels
             .iter()
@@ -668,6 +681,7 @@ impl DriverState {
                 Heartbeat,
                 Payload(Option<PayloadResult>),
                 Rejoin(Option<String>),
+                OperationTimeout(Option<OperationTimeout>),
             }
 
             let action = {
@@ -687,13 +701,21 @@ impl DriverState {
                     Box::pin(rejoins.next())
                 };
                 let rejoin = rejoin.fuse();
+                let operation_timeout: LocalBoxFuture<'_, Option<OperationTimeout>> =
+                    if operation_timeouts.is_empty() {
+                        Box::pin(pending())
+                    } else {
+                        Box::pin(operation_timeouts.next())
+                    };
+                let operation_timeout = operation_timeout.fuse();
                 futures::pin_mut!(
                     lifecycle,
                     command,
                     incoming,
                     heartbeat_wait,
                     payload,
-                    rejoin
+                    rejoin,
+                    operation_timeout
                 );
                 futures::select_biased! {
                     lifecycle = lifecycle => Action::Lifecycle(lifecycle),
@@ -702,6 +724,7 @@ impl DriverState {
                     () = heartbeat_wait => Action::Heartbeat,
                     payload = payload => Action::Payload(payload),
                     topic = rejoin => Action::Rejoin(topic),
+                    timeout = operation_timeout => Action::OperationTimeout(timeout),
                 }
             };
 
@@ -716,8 +739,13 @@ impl DriverState {
                     return ConnectedExit::Shutdown(response);
                 }
                 Action::Command(Some(command)) => {
-                    self.handle_connected_command(command, transport, &mut payloads)
-                        .await
+                    self.handle_connected_command(
+                        command,
+                        transport,
+                        &mut payloads,
+                        &mut operation_timeouts,
+                    )
+                    .await
                 }
                 Action::Command(None) => {
                     return ConnectedExit::Disconnected("command channel closed".into());
@@ -728,6 +756,7 @@ impl DriverState {
                         transport,
                         &mut payloads,
                         &mut rejoins,
+                        &mut operation_timeouts,
                         &mut heartbeat_reference,
                     )
                     .await
@@ -745,19 +774,31 @@ impl DriverState {
                     }
                 }
                 Action::Payload(Some((topic, payload_id, payload))) => {
-                    self.handle_payload(topic, payload_id, payload, transport)
-                        .await
+                    self.handle_payload(
+                        topic,
+                        payload_id,
+                        payload,
+                        transport,
+                        &mut operation_timeouts,
+                    )
+                    .await
                 }
                 Action::Payload(None) => Ok(()),
                 Action::Rejoin(Some(topic)) => {
-                    if let Some(channel) = self.channels.get(&topic)
-                        && channel.desired
-                    {
+                    let desired = self.channels.get_mut(&topic).is_some_and(|channel| {
+                        channel.rejoin_scheduled = false;
+                        channel.desired
+                    });
+                    if desired {
                         self.load_payload(&topic, &mut payloads);
                     }
                     Ok(())
                 }
                 Action::Rejoin(None) => Ok(()),
+                Action::OperationTimeout(Some(timeout)) => {
+                    self.handle_operation_timeout(timeout, &mut payloads, &mut rejoins)
+                }
+                Action::OperationTimeout(None) => Ok(()),
             };
 
             if let Err(reason) = result {
@@ -881,6 +922,7 @@ impl DriverState {
         command: Command,
         transport: &mut Box<dyn Transport>,
         payloads: &mut FuturesUnordered<LocalBoxFuture<'static, PayloadResult>>,
+        operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
     ) -> Result<(), String> {
         match command {
             Command::Subscribe { events } => self.socket_subscribers.push(events),
@@ -966,12 +1008,27 @@ impl DriverState {
                         .protocol
                         .leave(&topic)
                         .map_err(|error| error.to_string())?;
-                    self.pending_leaves
-                        .insert(outbound.reference.clone(), PendingLeave { id, response });
+                    self.pending_leaves.insert(
+                        outbound.reference.clone(),
+                        PendingLeave {
+                            id,
+                            response: Some(response),
+                        },
+                    );
+                    self.schedule_operation_timeout(
+                        OperationTimeout::Leave {
+                            topic,
+                            reference: outbound.reference.clone(),
+                        },
+                        operation_timeouts,
+                    );
                     self.send_frame(transport, outbound.frame).await?;
                 } else if state == Some(ChannelState::Joining) {
                     if let Some(channel) = self.channels.get_mut(&topic) {
-                        channel.deferred_leave = Some(PendingLeave { id, response });
+                        channel.deferred_leave = Some(PendingLeave {
+                            id,
+                            response: Some(response),
+                        });
                     } else {
                         let _ = response.send(Ok(json!({})));
                     }
@@ -999,6 +1056,7 @@ impl DriverState {
             ever_joined: false,
             active_payload: None,
             join_attempt: 0,
+            rejoin_scheduled: false,
             join_waiters: HashMap::new(),
             queued: VecDeque::new(),
             deferred_leave: None,
@@ -1071,6 +1129,7 @@ impl DriverState {
         payload_id: u64,
         payload: Result<Value, String>,
         transport: &mut Box<dyn Transport>,
+        operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
     ) -> Result<(), String> {
         let Some(channel) = self.channels.get_mut(&topic) else {
             return Ok(());
@@ -1105,6 +1164,15 @@ impl DriverState {
         if let Some(channel) = self.channels.get(&topic) {
             channel.status.set(ChannelStatus::Joining);
         }
+        self.pending_joins
+            .insert(outbound.reference.clone(), topic.clone());
+        self.schedule_operation_timeout(
+            OperationTimeout::Join {
+                topic,
+                reference: outbound.reference.clone(),
+            },
+            operation_timeouts,
+        );
         self.send_frame(transport, outbound.frame).await
     }
 
@@ -1114,6 +1182,7 @@ impl DriverState {
         transport: &mut Box<dyn Transport>,
         payloads: &mut FuturesUnordered<LocalBoxFuture<'static, PayloadResult>>,
         rejoins: &mut FuturesUnordered<LocalBoxFuture<'static, String>>,
+        operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
         heartbeat_reference: &mut Option<String>,
     ) -> Result<(), String> {
         let WireMessage::Text(text) = message else {
@@ -1127,11 +1196,15 @@ impl DriverState {
 
         match &event {
             ProtocolEvent::Joined {
-                topic, response, ..
+                topic,
+                reference,
+                response,
             } => {
+                self.pending_joins.remove(reference);
                 let deferred_leave = if let Some(channel) = self.channels.get_mut(topic) {
                     channel.ever_joined = true;
                     channel.join_attempt = 0;
+                    channel.rejoin_scheduled = false;
                     let deferred_leave = channel.deferred_leave.take();
                     channel.status.set(if deferred_leave.is_some() {
                         ChannelStatus::Leaving
@@ -1153,18 +1226,30 @@ impl DriverState {
                         .map_err(|error| error.to_string())?;
                     self.pending_leaves
                         .insert(outbound.reference.clone(), pending);
+                    self.schedule_operation_timeout(
+                        OperationTimeout::Leave {
+                            topic: topic.clone(),
+                            reference: outbound.reference.clone(),
+                        },
+                        operation_timeouts,
+                    );
                     self.send_frame(transport, outbound.frame).await?;
                 } else {
                     self.flush(topic, transport).await?;
                 }
             }
             ProtocolEvent::JoinError {
-                topic, response, ..
+                topic,
+                reference,
+                response,
             } => {
+                self.pending_joins.remove(reference);
                 if let Some(channel) = self.channels.get_mut(topic) {
                     channel.status.set(ChannelStatus::Errored);
                     if let Some(pending) = channel.deferred_leave.take() {
-                        let _ = pending.response.send(Ok(json!({})));
+                        if let Some(response) = pending.response {
+                            let _ = response.send(Ok(json!({})));
+                        }
                         channel.status.set(ChannelStatus::Left);
                     }
                     for (_, waiter) in channel.join_waiters.drain() {
@@ -1195,7 +1280,9 @@ impl DriverState {
                 topic,
             } => {
                 if let Some(pending) = self.pending_leaves.remove(reference) {
-                    let _ = pending.response.send(Ok(response.clone()));
+                    if let Some(response_tx) = pending.response {
+                        let _ = response_tx.send(Ok(response.clone()));
+                    }
                 }
                 let should_rejoin = self
                     .channels
@@ -1219,6 +1306,8 @@ impl DriverState {
                 }
             }
             ProtocolEvent::ChannelError { topic, .. } => {
+                self.pending_joins
+                    .retain(|_, pending_topic| pending_topic != topic);
                 if let Some(channel) = self.channels.get(topic) {
                     channel.status.set(ChannelStatus::Errored);
                 }
@@ -1226,6 +1315,8 @@ impl DriverState {
                 self.schedule_rejoin(topic, rejoins);
             }
             ProtocolEvent::ChannelClosed { topic, .. } => {
+                self.pending_joins
+                    .retain(|_, pending_topic| pending_topic != topic);
                 if let Some(channel) = self.channels.get_mut(topic) {
                     channel.desired = false;
                     channel.status.set(ChannelStatus::Closed);
@@ -1257,9 +1348,10 @@ impl DriverState {
         let Some(channel) = self.channels.get_mut(topic) else {
             return;
         };
-        if !channel.desired {
+        if !channel.desired || channel.rejoin_scheduled {
             return;
         }
+        channel.rejoin_scheduled = true;
         channel.join_attempt = channel.join_attempt.saturating_add(1);
         let delay = (self.options.rejoin_delay)(channel.join_attempt);
         let timer = self.timer.clone();
@@ -1268,6 +1360,80 @@ impl DriverState {
             timer.sleep(delay).await;
             topic
         }));
+    }
+
+    fn schedule_operation_timeout(
+        &self,
+        operation: OperationTimeout,
+        timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
+    ) {
+        let timer = self.timer.clone();
+        let timeout = self.options.request_timeout;
+        timeouts.push(Box::pin(async move {
+            timer.sleep(timeout).await;
+            operation
+        }));
+    }
+
+    fn handle_operation_timeout(
+        &mut self,
+        timeout: OperationTimeout,
+        payloads: &mut FuturesUnordered<LocalBoxFuture<'static, PayloadResult>>,
+        rejoins: &mut FuturesUnordered<LocalBoxFuture<'static, String>>,
+    ) -> Result<(), String> {
+        match timeout {
+            OperationTimeout::Join { topic, reference } => {
+                if self.pending_joins.remove(&reference).as_deref() != Some(topic.as_str()) {
+                    return Ok(());
+                }
+                self.protocol.discard_channel(&topic);
+                let mut should_rejoin = false;
+                if let Some(channel) = self.channels.get_mut(&topic) {
+                    channel.active_payload = None;
+                    if let Some(pending) = channel.deferred_leave.take() {
+                        if let Some(response) = pending.response {
+                            let _ = response.send(Err(ClientError::Timeout));
+                        }
+                        channel.status.set(ChannelStatus::Left);
+                    } else if channel.desired {
+                        channel.status.set(ChannelStatus::Errored);
+                        for (_, waiter) in channel.join_waiters.drain() {
+                            let _ = waiter.send(Err(ClientError::Timeout));
+                        }
+                        should_rejoin = true;
+                    } else {
+                        channel.status.set(ChannelStatus::Left);
+                    }
+                }
+                if should_rejoin {
+                    self.schedule_rejoin(&topic, rejoins);
+                }
+            }
+            OperationTimeout::Leave { topic, reference } => {
+                let Some(pending) = self.pending_leaves.remove(&reference) else {
+                    return Ok(());
+                };
+                if let Some(response) = pending.response {
+                    let _ = response.send(Err(ClientError::Timeout));
+                }
+                self.protocol.discard_channel(&topic);
+                let should_rejoin = self
+                    .channels
+                    .get(&topic)
+                    .is_some_and(|channel| channel.desired);
+                if let Some(channel) = self.channels.get(&topic) {
+                    channel.status.set(if should_rejoin {
+                        ChannelStatus::WaitingToJoin
+                    } else {
+                        ChannelStatus::Left
+                    });
+                }
+                if should_rejoin {
+                    self.load_payload(&topic, payloads);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn flush(
@@ -1347,12 +1513,12 @@ impl DriverState {
     fn cancel(&mut self, id: RequestId) {
         for channel in self.channels.values_mut() {
             channel.join_waiters.remove(&id);
-            if channel
+            if let Some(pending) = channel
                 .deferred_leave
-                .as_ref()
-                .is_some_and(|pending| pending.id == id)
+                .as_mut()
+                .filter(|pending| pending.id == id)
             {
-                channel.deferred_leave.take();
+                pending.response.take();
                 return;
             }
             if let Some(index) = channel.queued.iter().position(|push| push.id() == id) {
@@ -1373,7 +1539,9 @@ impl DriverState {
             .iter()
             .find_map(|(reference, pending)| (pending.id == id).then(|| reference.clone()));
         if let Some(reference) = reference {
-            self.pending_leaves.remove(&reference);
+            if let Some(pending) = self.pending_leaves.get_mut(&reference) {
+                pending.response.take();
+            }
         }
     }
 
@@ -1381,8 +1549,11 @@ impl DriverState {
         if let Some(channel) = self.channels.get_mut(topic) {
             channel.desired = false;
             channel.active_payload = None;
+            channel.rejoin_scheduled = false;
             if let Some(pending) = channel.deferred_leave.take() {
-                let _ = pending.response.send(Err(ClientError::Interrupted));
+                if let Some(response) = pending.response {
+                    let _ = response.send(Err(ClientError::Interrupted));
+                }
             }
             for (_, waiter) in channel.join_waiters.drain() {
                 let _ = waiter.send(Err(ClientError::Interrupted));
@@ -1395,17 +1566,23 @@ impl DriverState {
 
     fn on_disconnect(&mut self, reason: &str) {
         let events = self.protocol.reset_connection();
+        self.pending_joins.clear();
         for (_, pending) in self.pending_calls.drain() {
             let _ = pending.response.send(Err(ClientError::Interrupted));
         }
         for (_, pending) in self.pending_leaves.drain() {
-            let _ = pending.response.send(Err(ClientError::Interrupted));
+            if let Some(response) = pending.response {
+                let _ = response.send(Err(ClientError::Interrupted));
+            }
         }
         let topics = self.channels.keys().cloned().collect::<Vec<_>>();
         for channel in self.channels.values_mut() {
             channel.active_payload = None;
+            channel.rejoin_scheduled = false;
             if let Some(pending) = channel.deferred_leave.take() {
-                let _ = pending.response.send(Err(ClientError::Interrupted));
+                if let Some(response) = pending.response {
+                    let _ = response.send(Err(ClientError::Interrupted));
+                }
             }
             let status = if channel.desired {
                 ChannelStatus::WaitingForSocket
