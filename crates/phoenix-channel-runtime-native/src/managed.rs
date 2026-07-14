@@ -1,11 +1,14 @@
 use std::{
-    collections::HashMap,
+    any::Any,
+    collections::{HashMap, HashSet},
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -19,7 +22,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::{NativeConnector, NativeTimer};
+use crate::{NativeConnector, NativeTimer, NativeTransportOptions};
 
 pub type NativeConnectionConfigLoader = Arc<
     dyn Fn(ConnectContext) -> BoxFuture<'static, Result<ConnectionConfig, String>> + Send + Sync,
@@ -57,6 +60,7 @@ pub struct NativeOptions {
     command_capacity: usize,
     push_buffer_capacity: usize,
     event_capacity: usize,
+    transport: NativeTransportOptions,
     telemetry: Option<NativeTelemetryHook>,
 }
 
@@ -81,6 +85,7 @@ impl Default for NativeOptions {
             command_capacity: 64,
             push_buffer_capacity: 64,
             event_capacity: 256,
+            transport: NativeTransportOptions::default(),
             telemetry: None,
         }
     }
@@ -154,6 +159,11 @@ impl NativeOptions {
         self
     }
 
+    pub fn transport(mut self, options: NativeTransportOptions) -> Self {
+        self.transport = options;
+        self
+    }
+
     fn client_options(&self) -> Options {
         let reconnect_delays = self.reconnect_delays.clone();
         let rejoin_delays = self.rejoin_delays.clone();
@@ -205,6 +215,17 @@ pub enum NativeRuntimeError {
     WorkerStart(String),
     #[error("native client worker stopped")]
     WorkerStopped,
+    #[error("native client worker failed: {0}")]
+    WorkerFailed(String),
+    #[error("failed to join native client worker: {0}")]
+    WorkerJoin(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeWorkerStatus {
+    Running,
+    Stopped,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -217,6 +238,55 @@ pub enum NativeEventError {
 
 struct WorkerOwner {
     commands: mpsc::Sender<HostCommand>,
+    control: mpsc::UnboundedSender<ControlCommand>,
+    next_request: AtomicU64,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    status: watch::Receiver<NativeWorkerStatus>,
+}
+
+impl WorkerOwner {
+    fn next_request_id(&self) -> u64 {
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            self.next_request.store(2, Ordering::Relaxed);
+            1
+        } else {
+            id
+        }
+    }
+
+    fn join(&self) -> Result<(), NativeRuntimeError> {
+        let Some(worker) = self
+            .worker
+            .lock()
+            .map_err(|error| NativeRuntimeError::WorkerJoin(error.to_string()))?
+            .take()
+        else {
+            return self.worker_result();
+        };
+        worker
+            .join()
+            .map_err(|panic| NativeRuntimeError::WorkerJoin(panic_message(panic.as_ref())))?;
+        self.worker_result()
+    }
+
+    fn worker_result(&self) -> Result<(), NativeRuntimeError> {
+        match self.status.borrow().clone() {
+            NativeWorkerStatus::Failed(message) => Err(NativeRuntimeError::WorkerFailed(message)),
+            NativeWorkerStatus::Running | NativeWorkerStatus::Stopped => Ok(()),
+        }
+    }
+}
+
+impl Drop for WorkerOwner {
+    fn drop(&mut self) {
+        let _ = self.control.send(ControlCommand::Shutdown);
+        if let Ok(worker) = self.worker.get_mut() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -254,24 +324,64 @@ impl NativeSocket {
         let endpoint = endpoint.into();
         Endpoint::new(&endpoint)?;
         let (commands, command_rx) = mpsc::channel(options.command_capacity);
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let worker_control = control.clone();
         let (events, _) = broadcast::channel(options.event_capacity);
         let (status_tx, status) = watch::channel(SocketStatus::Disconnected);
+        let (worker_status_tx, worker_status) = watch::channel(NativeWorkerStatus::Running);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker_events = events.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("phoenix-channel-runtime".into())
             .spawn(move || {
-                run_worker(
-                    endpoint,
-                    config_loader,
-                    options,
-                    command_rx,
-                    worker_events,
-                    status_tx,
-                );
+                let fallback_ready = ready_tx.clone();
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    run_worker(WorkerBootstrap {
+                        endpoint_url: endpoint,
+                        config_loader,
+                        options,
+                        commands: command_rx,
+                        control: control_rx,
+                        control_tx: worker_control,
+                        events: worker_events,
+                        status: status_tx,
+                        ready: ready_tx,
+                    })
+                }));
+                let final_status = match result {
+                    Ok(Ok(())) => NativeWorkerStatus::Stopped,
+                    Ok(Err(message)) => {
+                        let _ = fallback_ready.send(Err(message.clone()));
+                        NativeWorkerStatus::Failed(message)
+                    }
+                    Err(panic) => {
+                        let message = panic_message(panic.as_ref());
+                        let _ = fallback_ready.send(Err(message.clone()));
+                        NativeWorkerStatus::Failed(message)
+                    }
+                };
+                worker_status_tx.send_replace(final_status);
             })
             .map_err(|error| NativeRuntimeError::WorkerStart(error.to_string()))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(NativeRuntimeError::WorkerStart(error));
+            }
+            Err(error) => {
+                let _ = worker.join();
+                return Err(NativeRuntimeError::WorkerStart(error.to_string()));
+            }
+        }
         Ok(Self {
-            owner: Arc::new(WorkerOwner { commands }),
+            owner: Arc::new(WorkerOwner {
+                commands,
+                control,
+                next_request: AtomicU64::new(1),
+                worker: Mutex::new(Some(worker)),
+                status: worker_status,
+            }),
             events,
             status,
         })
@@ -293,14 +403,45 @@ impl NativeSocket {
         }
     }
 
+    pub fn worker_status(&self) -> NativeWorkerStatus {
+        self.owner.status.borrow().clone()
+    }
+
+    pub fn worker_status_changes(&self) -> NativeWorkerStatusChanges {
+        NativeWorkerStatusChanges {
+            receiver: self.owner.status.clone(),
+        }
+    }
+
     pub async fn connect(&self) -> Result<(), NativeRuntimeError> {
-        self.unit_command(|response| HostCommand::Connect { response })
-            .await
+        self.unit_request(|request_id, response| HostCommand::Connect {
+            request_id,
+            response,
+        })
+        .await
     }
 
     pub async fn disconnect(&self) -> Result<(), NativeRuntimeError> {
-        self.unit_command(|response| HostCommand::Disconnect { response })
-            .await
+        self.unit_request(|request_id, response| HostCommand::Disconnect {
+            request_id,
+            response,
+        })
+        .await
+    }
+
+    pub async fn disconnect_with(
+        &self,
+        code: u16,
+        reason: impl Into<String>,
+    ) -> Result<(), NativeRuntimeError> {
+        let reason = reason.into();
+        self.unit_request(|request_id, response| HostCommand::DisconnectWith {
+            request_id,
+            code,
+            reason,
+            response,
+        })
+        .await
     }
 
     pub async fn channel(
@@ -317,22 +458,18 @@ impl NativeSocket {
         topic: impl Into<String>,
         payload_loader: NativeJoinPayloadLoader,
     ) -> Result<NativeChannel, NativeRuntimeError> {
-        let (response, receiver) = oneshot::channel();
-        self.owner
-            .commands
-            .send(HostCommand::Channel {
+        let registration = self
+            .request(|request_id, response| HostCommand::Channel {
+                request_id,
                 topic: topic.into(),
                 payload_loader,
                 response,
             })
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)?;
-        let registration = receiver
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)??;
+            .await?;
         Ok(NativeChannel {
             inner: Arc::new(NativeChannelInner {
                 id: registration.id,
+                topic: registration.topic,
                 owner: self.owner.clone(),
                 events: registration.events,
                 status: registration.status,
@@ -342,7 +479,19 @@ impl NativeSocket {
 
     pub async fn shutdown(&self) -> Result<(), NativeRuntimeError> {
         self.unit_command(|response| HostCommand::Shutdown { response })
-            .await
+            .await?;
+        self.owner.join()
+    }
+
+    pub fn join_worker(&self) -> Result<(), NativeRuntimeError> {
+        self.owner.join()
+    }
+
+    async fn unit_request(
+        &self,
+        build: impl FnOnce(u64, oneshot::Sender<Result<(), ClientError>>) -> HostCommand,
+    ) -> Result<(), NativeRuntimeError> {
+        self.request(build).await
     }
 
     async fn unit_command(
@@ -350,15 +499,22 @@ impl NativeSocket {
         build: impl FnOnce(oneshot::Sender<Result<(), ClientError>>) -> HostCommand,
     ) -> Result<(), NativeRuntimeError> {
         let (response, receiver) = oneshot::channel();
-        self.owner
-            .commands
-            .send(build(response))
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)?;
-        receiver
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)??;
+        if self.owner.commands.send(build(response)).await.is_err() {
+            return Err(wait_for_worker_error(&self.owner).await);
+        }
+        let result = match receiver.await {
+            Ok(result) => result,
+            Err(_) => return Err(wait_for_worker_error(&self.owner).await),
+        };
+        result?;
         Ok(())
+    }
+
+    async fn request<T: Send + 'static>(
+        &self,
+        build: impl FnOnce(u64, oneshot::Sender<Result<T, ClientError>>) -> HostCommand,
+    ) -> Result<T, NativeRuntimeError> {
+        request_worker(&self.owner, build).await
     }
 }
 
@@ -374,6 +530,24 @@ impl NativeSocketEvents {
 
 pub struct NativeSocketStatusChanges {
     receiver: watch::Receiver<SocketStatus>,
+}
+
+pub struct NativeWorkerStatusChanges {
+    receiver: watch::Receiver<NativeWorkerStatus>,
+}
+
+impl NativeWorkerStatusChanges {
+    pub fn current(&self) -> NativeWorkerStatus {
+        self.receiver.borrow().clone()
+    }
+
+    pub async fn changed(&mut self) -> Result<NativeWorkerStatus, NativeEventError> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| NativeEventError::Closed)?;
+        Ok(self.receiver.borrow_and_update().clone())
+    }
 }
 
 impl NativeSocketStatusChanges {
@@ -397,6 +571,7 @@ pub struct NativeChannel {
 
 struct NativeChannelInner {
     id: u64,
+    topic: String,
     owner: Arc<WorkerOwner>,
     events: broadcast::Sender<ChannelEvent>,
     status: watch::Receiver<ChannelStatus>,
@@ -406,12 +581,16 @@ impl Drop for NativeChannelInner {
     fn drop(&mut self) {
         let _ = self
             .owner
-            .commands
-            .try_send(HostCommand::RemoveChannel { id: self.id });
+            .control
+            .send(ControlCommand::RemoveChannel(self.id));
     }
 }
 
 impl NativeChannel {
+    pub fn topic(&self) -> &str {
+        &self.inner.topic
+    }
+
     pub fn status(&self) -> ChannelStatus {
         *self.inner.status.borrow()
     }
@@ -429,8 +608,23 @@ impl NativeChannel {
     }
 
     pub async fn join(&self) -> Result<Payload, NativeRuntimeError> {
-        self.request(|response| HostCommand::Join {
+        self.request(|request_id, response| HostCommand::Join {
+            request_id,
             id: self.inner.id,
+            timeout: None,
+            response,
+        })
+        .await
+    }
+
+    pub async fn join_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Payload, NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Join {
+            request_id,
+            id: self.inner.id,
+            timeout: Some(timeout),
             response,
         })
         .await
@@ -441,10 +635,29 @@ impl NativeChannel {
         event: impl Into<String>,
         payload: impl Into<Payload>,
     ) -> Result<Reply, NativeRuntimeError> {
-        self.request(|response| HostCommand::Call {
+        self.request(|request_id, response| HostCommand::Call {
+            request_id,
             id: self.inner.id,
             event: event.into(),
             payload: payload.into(),
+            timeout: None,
+            response,
+        })
+        .await
+    }
+
+    pub async fn call_with_timeout(
+        &self,
+        event: impl Into<String>,
+        payload: impl Into<Payload>,
+        timeout: Duration,
+    ) -> Result<Reply, NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Call {
+            request_id,
+            id: self.inner.id,
+            event: event.into(),
+            payload: payload.into(),
+            timeout: Some(timeout),
             response,
         })
         .await
@@ -455,18 +668,52 @@ impl NativeChannel {
         event: impl Into<String>,
         payload: impl Into<Payload>,
     ) -> Result<(), NativeRuntimeError> {
-        self.request(|response| HostCommand::Cast {
+        self.request(|request_id, response| HostCommand::Cast {
+            request_id,
             id: self.inner.id,
             event: event.into(),
             payload: payload.into(),
+            timeout: None,
+            response,
+        })
+        .await
+    }
+
+    pub async fn cast_with_timeout(
+        &self,
+        event: impl Into<String>,
+        payload: impl Into<Payload>,
+        timeout: Duration,
+    ) -> Result<(), NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Cast {
+            request_id,
+            id: self.inner.id,
+            event: event.into(),
+            payload: payload.into(),
+            timeout: Some(timeout),
             response,
         })
         .await
     }
 
     pub async fn leave(&self) -> Result<Payload, NativeRuntimeError> {
-        self.request(|response| HostCommand::Leave {
+        self.request(|request_id, response| HostCommand::Leave {
+            request_id,
             id: self.inner.id,
+            timeout: None,
+            response,
+        })
+        .await
+    }
+
+    pub async fn leave_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Payload, NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Leave {
+            request_id,
+            id: self.inner.id,
+            timeout: Some(timeout),
             response,
         })
         .await
@@ -474,18 +721,71 @@ impl NativeChannel {
 
     async fn request<T: Send + 'static>(
         &self,
-        build: impl FnOnce(oneshot::Sender<Result<T, ClientError>>) -> HostCommand,
+        build: impl FnOnce(u64, oneshot::Sender<Result<T, ClientError>>) -> HostCommand,
     ) -> Result<T, NativeRuntimeError> {
-        let (response, receiver) = oneshot::channel();
-        self.inner
-            .owner
-            .commands
-            .send(build(response))
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)?;
-        Ok(receiver
-            .await
-            .map_err(|_| NativeRuntimeError::WorkerStopped)??)
+        request_worker(&self.inner.owner, build).await
+    }
+}
+
+async fn request_worker<T: Send + 'static>(
+    owner: &Arc<WorkerOwner>,
+    build: impl FnOnce(u64, oneshot::Sender<Result<T, ClientError>>) -> HostCommand,
+) -> Result<T, NativeRuntimeError> {
+    let permit = match owner.commands.reserve().await {
+        Ok(permit) => permit,
+        Err(_) => return Err(wait_for_worker_error(owner).await),
+    };
+    let request_id = owner.next_request_id();
+    let (response, receiver) = oneshot::channel();
+    if owner
+        .control
+        .send(ControlCommand::Register(request_id))
+        .is_err()
+    {
+        return Err(wait_for_worker_error(owner).await);
+    }
+    let mut guard = HostRequestGuard {
+        request_id,
+        control: owner.control.clone(),
+        armed: true,
+    };
+    permit.send(build(request_id, response));
+    let result = match receiver.await {
+        Ok(result) => result?,
+        Err(_) => return Err(wait_for_worker_error(owner).await),
+    };
+    guard.armed = false;
+    Ok(result)
+}
+
+fn worker_error(owner: &WorkerOwner) -> NativeRuntimeError {
+    match owner.status.borrow().clone() {
+        NativeWorkerStatus::Failed(message) => NativeRuntimeError::WorkerFailed(message),
+        NativeWorkerStatus::Running | NativeWorkerStatus::Stopped => {
+            NativeRuntimeError::WorkerStopped
+        }
+    }
+}
+
+async fn wait_for_worker_error(owner: &WorkerOwner) -> NativeRuntimeError {
+    let mut status = owner.status.clone();
+    if matches!(*status.borrow(), NativeWorkerStatus::Running) {
+        let _ = status.changed().await;
+    }
+    worker_error(owner)
+}
+
+struct HostRequestGuard {
+    request_id: u64,
+    control: mpsc::UnboundedSender<ControlCommand>,
+    armed: bool,
+}
+
+impl Drop for HostRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.control.send(ControlCommand::Cancel(self.request_id));
+        }
     }
 }
 
@@ -528,106 +828,159 @@ async fn receive_event<T: Clone>(
 
 struct ChannelRegistration {
     id: u64,
+    topic: String,
     events: broadcast::Sender<ChannelEvent>,
     status: watch::Receiver<ChannelStatus>,
 }
 
 enum HostCommand {
     Connect {
+        request_id: u64,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Disconnect {
+        request_id: u64,
+        response: oneshot::Sender<Result<(), ClientError>>,
+    },
+    DisconnectWith {
+        request_id: u64,
+        code: u16,
+        reason: String,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Shutdown {
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Channel {
+        request_id: u64,
         topic: String,
         payload_loader: NativeJoinPayloadLoader,
         response: oneshot::Sender<Result<ChannelRegistration, ClientError>>,
     },
-    RemoveChannel {
-        id: u64,
-    },
     Join {
+        request_id: u64,
         id: u64,
+        timeout: Option<Duration>,
         response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Call {
+        request_id: u64,
         id: u64,
         event: String,
         payload: Payload,
+        timeout: Option<Duration>,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
+        request_id: u64,
         id: u64,
         event: String,
         payload: Payload,
+        timeout: Option<Duration>,
         response: oneshot::Sender<Result<(), ClientError>>,
     },
     Leave {
+        request_id: u64,
         id: u64,
+        timeout: Option<Duration>,
         response: oneshot::Sender<Result<Payload, ClientError>>,
     },
 }
 
-fn run_worker(
+enum ControlCommand {
+    Register(u64),
+    Cancel(u64),
+    Finished(u64),
+    RemoveChannel(u64),
+    Shutdown,
+}
+
+struct WorkerBootstrap {
     endpoint_url: String,
     config_loader: NativeConnectionConfigLoader,
     options: NativeOptions,
-    command_rx: mpsc::Receiver<HostCommand>,
+    commands: mpsc::Receiver<HostCommand>,
+    control: mpsc::UnboundedReceiver<ControlCommand>,
+    control_tx: mpsc::UnboundedSender<ControlCommand>,
     events: broadcast::Sender<SocketEvent>,
     status: watch::Sender<SocketStatus>,
-) {
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+}
+
+fn run_worker(bootstrap: WorkerBootstrap) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("native client runtime should be created");
-    tokio::task::LocalSet::new().block_on(
-        &runtime,
-        worker_main(
-            endpoint_url,
-            config_loader,
-            options,
-            command_rx,
-            events,
-            status,
-        ),
-    );
+        .map_err(|error| error.to_string())?;
+    tokio::task::LocalSet::new().block_on(&runtime, worker_main(bootstrap))
 }
 
-async fn worker_main(
-    endpoint_url: String,
-    config_loader: NativeConnectionConfigLoader,
-    options: NativeOptions,
-    mut commands: mpsc::Receiver<HostCommand>,
-    events: broadcast::Sender<SocketEvent>,
-    status: watch::Sender<SocketStatus>,
-) {
+async fn worker_main(bootstrap: WorkerBootstrap) -> Result<(), String> {
+    let WorkerBootstrap {
+        endpoint_url,
+        config_loader,
+        options,
+        mut commands,
+        mut control,
+        control_tx,
+        events,
+        status,
+        ready,
+    } = bootstrap;
     let local_loader = Rc::new(move |context| {
         let config_loader = config_loader.clone();
         async move { config_loader(context).await }.boxed_local()
     });
     let endpoint = Endpoint::new(endpoint_url)
-        .expect("endpoint was validated before starting the worker")
+        .map_err(|error| error.to_string())?
         .connection_config_loader(local_loader);
     let event_capacity = options.event_capacity;
+    let transport_options = options.transport.clone();
     let (socket, driver) = Socket::new(
-        NativeConnector::from_endpoint(endpoint),
+        NativeConnector::from_endpoint(endpoint).options(transport_options),
         NativeTimer,
         options.client_options(),
     );
-    let mut socket_events = socket
-        .events()
-        .expect("new socket event subscription should succeed");
+    let mut socket_events = socket.events().map_err(|error| error.to_string())?;
     let mut socket_statuses = socket.status_changes();
-    tokio::task::spawn_local(driver);
+    let mut driver_task = tokio::task::spawn_local(driver);
     let next_id = AtomicU64::new(1);
     let mut channels: HashMap<u64, Rc<Channel>> = HashMap::new();
+    let mut operations: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+    let mut known_requests = HashSet::new();
+    let mut cancelled = HashSet::new();
+    let _ = ready.send(Ok(()));
 
     loop {
         tokio::select! {
+            driver_result = &mut driver_task => match driver_result {
+                Ok(()) => break,
+                Err(error) => return Err(format!("client driver task failed: {error}")),
+            },
+            control_command = control.recv() => match control_command {
+                Some(ControlCommand::Register(request_id)) => {
+                    known_requests.insert(request_id);
+                }
+                Some(ControlCommand::Cancel(request_id)) => {
+                    if let Some(operation) = operations.remove(&request_id) {
+                        operation.abort();
+                    } else if known_requests.contains(&request_id) {
+                        cancelled.insert(request_id);
+                    }
+                }
+                Some(ControlCommand::Finished(request_id)) => {
+                    operations.remove(&request_id);
+                    known_requests.remove(&request_id);
+                    cancelled.remove(&request_id);
+                }
+                Some(ControlCommand::RemoveChannel(id)) => {
+                    channels.remove(&id);
+                }
+                Some(ControlCommand::Shutdown) | None => {
+                    let _ = socket.shutdown().await;
+                    break;
+                }
+            },
             event = socket_events.next() => match event {
                 Some(event) => {
                     let _ = events.send(event);
@@ -645,39 +998,99 @@ async fn worker_main(
                     let _ = socket.shutdown().await;
                     break;
                 };
-                if handle_host_command(
-                    command,
-                    &socket,
-                    &mut channels,
-                    &next_id,
+                let mut host = HostState {
+                    channels: &mut channels,
+                    next_id: &next_id,
                     event_capacity,
-                ).await {
+                    control: &control_tx,
+                    operations: &mut operations,
+                    known_requests: &mut known_requests,
+                    cancelled: &mut cancelled,
+                };
+                if handle_host_command(command, &socket, &mut host).await {
                     break;
                 }
             }
         }
     }
     status.send_replace(SocketStatus::Closed);
+    for (_, operation) in operations {
+        operation.abort();
+    }
+    if driver_task.is_finished() {
+        driver_task
+            .await
+            .map_err(|error| format!("client driver task failed: {error}"))?;
+    } else {
+        driver_task.abort();
+    }
+    Ok(())
+}
+
+struct HostState<'a> {
+    channels: &'a mut HashMap<u64, Rc<Channel>>,
+    next_id: &'a AtomicU64,
+    event_capacity: usize,
+    control: &'a mpsc::UnboundedSender<ControlCommand>,
+    operations: &'a mut HashMap<u64, tokio::task::JoinHandle<()>>,
+    known_requests: &'a mut HashSet<u64>,
+    cancelled: &'a mut HashSet<u64>,
 }
 
 async fn handle_host_command(
     command: HostCommand,
     socket: &Socket,
-    channels: &mut HashMap<u64, Rc<Channel>>,
-    next_id: &AtomicU64,
-    event_capacity: usize,
+    state: &mut HostState<'_>,
 ) -> bool {
+    let HostState {
+        channels,
+        next_id,
+        event_capacity,
+        control,
+        operations,
+        known_requests,
+        cancelled,
+    } = state;
     match command {
-        HostCommand::Connect { response } => {
+        HostCommand::Connect {
+            request_id,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
             let socket = socket.clone();
-            tokio::task::spawn_local(async move {
+            track_operation(request_id, control, operations, async move {
                 let _ = response.send(socket.connect().await);
             });
         }
-        HostCommand::Disconnect { response } => {
+        HostCommand::Disconnect {
+            request_id,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
             let socket = socket.clone();
-            tokio::task::spawn_local(async move {
+            track_operation(request_id, control, operations, async move {
                 let _ = response.send(socket.disconnect().await);
+            });
+        }
+        HostCommand::DisconnectWith {
+            request_id,
+            code,
+            reason,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let socket = socket.clone();
+            track_operation(request_id, control, operations, async move {
+                let _ = response.send(socket.disconnect_with(code, reason).await);
             });
         }
         HostCommand::Shutdown { response } => {
@@ -686,10 +1099,16 @@ async fn handle_host_command(
             return true;
         }
         HostCommand::Channel {
+            request_id,
             topic,
             payload_loader,
             response,
         } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let registration_topic = topic.clone();
             let local_loader = Rc::new(move |context| {
                 let payload_loader = payload_loader.clone();
                 async move { payload_loader(context).await }.boxed_local()
@@ -698,7 +1117,7 @@ async fn handle_host_command(
                 Ok(channel) => {
                     let id = next_id.fetch_add(1, Ordering::Relaxed);
                     let channel = Rc::new(channel);
-                    let (event_tx, _) = broadcast::channel(event_capacity);
+                    let (event_tx, _) = broadcast::channel(*event_capacity);
                     let (status_tx, status_rx) = watch::channel(channel.status());
                     let mut status_changes = channel.status_changes();
                     let mut event_rx = match channel.events() {
@@ -722,6 +1141,7 @@ async fn handle_host_command(
                     channels.insert(id, channel);
                     let _ = response.send(Ok(ChannelRegistration {
                         id,
+                        topic: registration_topic,
                         events: event_tx,
                         status: status_rx,
                     }));
@@ -731,45 +1151,100 @@ async fn handle_host_command(
                 }
             }
         }
-        HostCommand::RemoveChannel { id } => {
-            channels.remove(&id);
-        }
-        HostCommand::Join { id, response } => {
-            spawn_channel_response(channels.get(&id), response, |channel| async move {
-                channel.join().await
+        HostCommand::Join {
+            request_id,
+            id,
+            timeout,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let channel = channels.get(&id).cloned();
+            track_operation(request_id, control, operations, async move {
+                send_channel_response(channel, response, move |channel| async move {
+                    match timeout {
+                        Some(timeout) => channel.join_with_timeout(timeout).await,
+                        None => channel.join().await,
+                    }
+                })
+                .await;
             });
         }
         HostCommand::Call {
+            request_id,
             id,
             event,
             payload,
+            timeout,
             response,
         } => {
-            spawn_channel_response(channels.get(&id), response, |channel| async move {
-                channel.call(event, payload).await
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let channel = channels.get(&id).cloned();
+            track_operation(request_id, control, operations, async move {
+                send_channel_response(channel, response, move |channel| async move {
+                    match timeout {
+                        Some(timeout) => channel.call_with_timeout(event, payload, timeout).await,
+                        None => channel.call(event, payload).await,
+                    }
+                })
+                .await;
             });
         }
         HostCommand::Cast {
+            request_id,
             id,
             event,
             payload,
+            timeout,
             response,
         } => {
-            spawn_channel_response(channels.get(&id), response, |channel| async move {
-                channel.cast(event, payload).await
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let channel = channels.get(&id).cloned();
+            track_operation(request_id, control, operations, async move {
+                send_channel_response(channel, response, move |channel| async move {
+                    match timeout {
+                        Some(timeout) => channel.cast_with_timeout(event, payload, timeout).await,
+                        None => channel.cast(event, payload).await,
+                    }
+                })
+                .await;
             });
         }
-        HostCommand::Leave { id, response } => {
-            spawn_channel_response(channels.get(&id), response, |channel| async move {
-                channel.leave().await
+        HostCommand::Leave {
+            request_id,
+            id,
+            timeout,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let channel = channels.get(&id).cloned();
+            track_operation(request_id, control, operations, async move {
+                send_channel_response(channel, response, move |channel| async move {
+                    match timeout {
+                        Some(timeout) => channel.leave_with_timeout(timeout).await,
+                        None => channel.leave().await,
+                    }
+                })
+                .await;
             });
         }
     }
     false
 }
 
-fn spawn_channel_response<T, F, Fut>(
-    channel: Option<&Rc<Channel>>,
+async fn send_channel_response<T, F, Fut>(
+    channel: Option<Rc<Channel>>,
     response: oneshot::Sender<Result<T, ClientError>>,
     call: F,
 ) where
@@ -777,14 +1252,34 @@ fn spawn_channel_response<T, F, Fut>(
     F: FnOnce(Rc<Channel>) -> Fut + 'static,
     Fut: Future<Output = Result<T, ClientError>> + 'static,
 {
-    let Some(channel) = channel.cloned() else {
+    let Some(channel) = channel else {
         let _ = response.send(Err(ClientError::DriverStopped));
         return;
     };
-    tokio::task::spawn_local(async move {
-        let result = call(channel).await;
-        let _ = response.send(result);
+    let result = call(channel).await;
+    let _ = response.send(result);
+}
+
+fn track_operation(
+    request_id: u64,
+    control: &mpsc::UnboundedSender<ControlCommand>,
+    operations: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
+    operation: impl Future<Output = ()> + 'static,
+) {
+    let control = control.clone();
+    let handle = tokio::task::spawn_local(async move {
+        operation.await;
+        let _ = control.send(ControlCommand::Finished(request_id));
     });
+    operations.insert(request_id, handle);
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "worker panicked without a string payload".to_owned())
 }
 
 #[cfg(test)]
@@ -805,5 +1300,53 @@ mod tests {
         let delays = [Duration::from_secs(1), Duration::from_secs(3)];
         assert_eq!(retry_delay(&delays, 0), Duration::from_secs(1));
         assert_eq!(retry_delay(&delays, 8), Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_host_requests_do_not_prevent_shutdown() {
+        let socket =
+            NativeSocket::spawn("ws://127.0.0.1:9/socket", ConnectionConfig::default()).unwrap();
+        let channel = socket
+            .channel("room:lobby", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(channel.topic(), "room:lobby");
+
+        let pending = tokio::spawn({
+            let channel = channel.clone();
+            async move { channel.call("queued", serde_json::json!({})).await }
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        let _ = pending.await;
+
+        socket.shutdown().await.unwrap();
+        assert_eq!(socket.worker_status(), NativeWorkerStatus::Stopped);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reports_driver_panics_as_worker_failures() {
+        let options = NativeOptions::default().telemetry(Arc::new(|_| {
+            panic!("telemetry failure");
+        }));
+        let socket = NativeSocket::spawn_with_options(
+            "ws://127.0.0.1:9/socket",
+            ConnectionConfig::default(),
+            options,
+        )
+        .unwrap();
+        let _ = socket.connect().await;
+        assert!(matches!(
+            socket.shutdown().await,
+            Err(NativeRuntimeError::WorkerFailed(_))
+        ));
+        assert!(matches!(
+            socket.join_worker(),
+            Err(NativeRuntimeError::WorkerFailed(message)) if message.contains("client driver task failed")
+        ));
+        assert!(matches!(
+            socket.worker_status(),
+            NativeWorkerStatus::Failed(_)
+        ));
     }
 }

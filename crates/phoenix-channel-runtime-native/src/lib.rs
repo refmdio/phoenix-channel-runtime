@@ -4,22 +4,29 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use futures::{SinkExt, StreamExt};
     use phoenix_channel_client::{ConnectContext, Connector, Endpoint, ResolvedEndpoint, Timer};
     use phoenix_channel_runtime::{
-        Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
+        Transport, TransportClose, TransportCloseRequest, TransportError, TransportErrorKind,
+        TransportEvent, WireMessage,
     };
-    use tokio::net::TcpStream;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
     use tokio_tungstenite::{
-        MaybeTlsStream, WebSocketStream, connect_async,
+        Connector as TlsConnector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
         tungstenite::{
             Message,
             client::IntoClientRequest,
             http::{HeaderName, HeaderValue, header::SEC_WEBSOCKET_PROTOCOL},
+            protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
         },
     };
+    use url::Url;
 
     pub struct NativeTransport {
         inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -28,7 +35,124 @@ mod native {
     #[derive(Clone)]
     pub struct NativeConnector {
         endpoint: NativeEndpoint,
+        options: NativeTransportOptions,
+    }
+
+    #[derive(Clone)]
+    pub struct ProxyConfig {
+        url: String,
+        bypass_hosts: Vec<String>,
+    }
+
+    impl std::fmt::Debug for ProxyConfig {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("ProxyConfig")
+                .field("url", &"configured")
+                .field("bypass_hosts", &self.bypass_hosts)
+                .finish()
+        }
+    }
+
+    impl ProxyConfig {
+        pub fn new(url: impl Into<String>) -> Self {
+            Self {
+                url: url.into(),
+                bypass_hosts: Vec::new(),
+            }
+        }
+
+        pub fn bypass_host(mut self, host: impl Into<String>) -> Self {
+            self.bypass_hosts.push(host.into());
+            self
+        }
+
+        fn applies_to(&self, host: &str) -> bool {
+            !self.bypass_hosts.iter().any(|entry| {
+                let entry = entry.trim_start_matches('.');
+                host.eq_ignore_ascii_case(entry)
+                    || host
+                        .to_ascii_lowercase()
+                        .ends_with(&format!(".{}", entry.to_ascii_lowercase()))
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct NativeTransportOptions {
         headers: Vec<(String, String)>,
+        tls_config: Option<Arc<rustls::ClientConfig>>,
+        proxy: Option<ProxyConfig>,
+        max_message_size: Option<usize>,
+        max_frame_size: Option<usize>,
+        disable_nagle: bool,
+    }
+
+    impl std::fmt::Debug for NativeTransportOptions {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let header_names = self
+                .headers
+                .iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>();
+            formatter
+                .debug_struct("NativeTransportOptions")
+                .field("header_names", &header_names)
+                .field(
+                    "tls_config",
+                    &self.tls_config.as_ref().map(|_| "configured"),
+                )
+                .field("proxy", &self.proxy)
+                .field("max_message_size", &self.max_message_size)
+                .field("max_frame_size", &self.max_frame_size)
+                .field("disable_nagle", &self.disable_nagle)
+                .finish()
+        }
+    }
+
+    impl Default for NativeTransportOptions {
+        fn default() -> Self {
+            Self {
+                headers: Vec::new(),
+                tls_config: None,
+                proxy: None,
+                max_message_size: Some(16 * 1024 * 1024),
+                max_frame_size: Some(16 * 1024 * 1024),
+                disable_nagle: false,
+            }
+        }
+    }
+
+    impl NativeTransportOptions {
+        pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+            self.headers.push((name.into(), value.into()));
+            self
+        }
+
+        pub fn tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+            self.tls_config = Some(config);
+            self
+        }
+
+        pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
+            self.proxy = Some(proxy);
+            self
+        }
+
+        pub fn max_message_size(mut self, value: Option<usize>) -> Self {
+            self.max_message_size = value;
+            self
+        }
+
+        pub fn max_frame_size(mut self, value: Option<usize>) -> Self {
+            self.max_frame_size = value;
+            self
+        }
+
+        pub fn disable_nagle(mut self, value: bool) -> Self {
+            self.disable_nagle = value;
+            self
+        }
     }
 
     #[derive(Clone)]
@@ -41,19 +165,24 @@ mod native {
         pub fn new(url: impl Into<String>) -> Self {
             Self {
                 endpoint: NativeEndpoint::Url(url.into()),
-                headers: Vec::new(),
+                options: NativeTransportOptions::default(),
             }
         }
 
         pub fn from_endpoint(endpoint: Endpoint) -> Self {
             Self {
                 endpoint: NativeEndpoint::Phoenix(endpoint),
-                headers: Vec::new(),
+                options: NativeTransportOptions::default(),
             }
         }
 
         pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-            self.headers.push((name.into(), value.into()));
+            self.options = self.options.header(name, value);
+            self
+        }
+
+        pub fn options(mut self, options: NativeTransportOptions) -> Self {
+            self.options = options;
             self
         }
     }
@@ -65,7 +194,7 @@ mod native {
         ) -> futures::future::LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>>
         {
             let endpoint = self.endpoint.clone();
-            let headers = self.headers.clone();
+            let options = self.options.clone();
             Box::pin(async move {
                 let endpoint = match endpoint {
                     NativeEndpoint::Url(url) => ResolvedEndpoint {
@@ -81,7 +210,7 @@ mod native {
                         })?
                     }
                 };
-                let transport = NativeTransport::connect_resolved(endpoint, headers).await?;
+                let transport = NativeTransport::connect_resolved(endpoint, options).await?;
                 Ok(Box::new(transport) as Box<dyn Transport>)
             })
         }
@@ -103,19 +232,19 @@ mod native {
                     url: url.to_owned(),
                     protocols: Vec::new(),
                 },
-                Vec::new(),
+                NativeTransportOptions::default(),
             )
             .await
         }
 
         async fn connect_resolved(
             endpoint: ResolvedEndpoint,
-            headers: Vec<(String, String)>,
+            options: NativeTransportOptions,
         ) -> Result<Self, TransportError> {
             let mut request = endpoint.url.into_client_request().map_err(|error| {
                 TransportError::with_kind(TransportErrorKind::Connect, error.to_string())
             })?;
-            for (name, value) in headers {
+            for (name, value) in &options.headers {
                 let name = HeaderName::try_from(name).map_err(|error| {
                     TransportError::with_kind(TransportErrorKind::Connect, error.to_string())
                 })?;
@@ -131,11 +260,118 @@ mod native {
                     })?;
                 request.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, value);
             }
-            let (inner, _) = connect_async(request).await.map_err(|error| {
-                TransportError::with_kind(TransportErrorKind::Connect, error.to_string())
-            })?;
+            let host = request
+                .uri()
+                .host()
+                .ok_or_else(|| connect_error("WebSocket URL has no host"))?
+                .to_owned();
+            let port = request.uri().port_u16().unwrap_or_else(|| {
+                if request.uri().scheme_str() == Some("wss") {
+                    443
+                } else {
+                    80
+                }
+            });
+            let stream = if let Some(proxy) = options
+                .proxy
+                .as_ref()
+                .filter(|proxy| proxy.applies_to(&host))
+            {
+                connect_proxy(proxy, &host, port).await?
+            } else {
+                TcpStream::connect((host.as_str(), port))
+                    .await
+                    .map_err(|error| connect_error(error.to_string()))?
+            };
+            if options.disable_nagle {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| connect_error(error.to_string()))?;
+            }
+            let websocket_config = WebSocketConfig::default()
+                .max_message_size(options.max_message_size)
+                .max_frame_size(options.max_frame_size);
+            let tls = options.tls_config.map(TlsConnector::Rustls);
+            let (inner, _) =
+                client_async_tls_with_config(request, stream, Some(websocket_config), tls)
+                    .await
+                    .map_err(|error| {
+                        TransportError::with_kind(TransportErrorKind::Connect, error.to_string())
+                    })?;
             Ok(Self { inner })
         }
+    }
+
+    fn connect_error(message: impl Into<String>) -> TransportError {
+        TransportError::with_kind(TransportErrorKind::Connect, message)
+    }
+
+    async fn connect_proxy(
+        proxy: &ProxyConfig,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<TcpStream, TransportError> {
+        let url = Url::parse(&proxy.url).map_err(|error| connect_error(error.to_string()))?;
+        if url.scheme() != "http" {
+            return Err(connect_error("only HTTP CONNECT proxies are supported"));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| connect_error("proxy URL has no host"))?;
+        let port = url.port_or_known_default().unwrap_or(80);
+        let mut stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|error| connect_error(error.to_string()))?;
+        let authority = if target_host.contains(':') {
+            format!("[{target_host}]:{target_port}")
+        } else {
+            format!("{target_host}:{target_port}")
+        };
+        let authorization = if url.username().is_empty() {
+            String::new()
+        } else {
+            let credentials = format!("{}:{}", url.username(), url.password().unwrap_or_default());
+            format!(
+                "Proxy-Authorization: Basic {}\r\n",
+                BASE64.encode(credentials)
+            )
+        };
+        let request =
+            format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{authorization}\r\n");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .map_err(|error| connect_error(error.to_string()))?;
+        let mut response = Vec::with_capacity(1024);
+        let mut byte = [0_u8; 1];
+        while response.len() < 8192 && !response.ends_with(b"\r\n\r\n") {
+            let count = stream
+                .read(&mut byte)
+                .await
+                .map_err(|error| connect_error(error.to_string()))?;
+            if count == 0 {
+                return Err(connect_error("proxy closed before completing CONNECT"));
+            }
+            response.push(byte[0]);
+        }
+        if !response.ends_with(b"\r\n\r\n") {
+            return Err(connect_error(
+                "proxy CONNECT response headers are too large",
+            ));
+        }
+        let status = String::from_utf8_lossy(&response);
+        let accepted = status
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .is_some_and(|code| code.starts_with('2'));
+        if !accepted {
+            return Err(connect_error(format!(
+                "proxy CONNECT failed: {}",
+                status.lines().next().unwrap_or("invalid response")
+            )));
+        }
+        Ok(stream)
     }
 
     impl Transport for NativeTransport {
@@ -204,6 +440,62 @@ mod native {
                 })
             })
         }
+
+        fn close_with<'a>(
+            &'a mut self,
+            request: TransportCloseRequest,
+        ) -> futures::future::LocalBoxFuture<'a, Result<(), TransportError>> {
+            Box::pin(async move {
+                self.inner
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::from(request.code),
+                        reason: request.reason.into(),
+                    })))
+                    .await
+                    .map_err(|error| {
+                        TransportError::with_kind(TransportErrorKind::Close, error.to_string())
+                    })
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::net::TcpListener;
+
+        #[test]
+        fn proxy_bypass_matches_hosts_and_subdomains() {
+            let proxy = ProxyConfig::new("http://localhost:8080").bypass_host("example.com");
+            assert!(!proxy.applies_to("example.com"));
+            assert!(!proxy.applies_to("api.example.com"));
+            assert!(proxy.applies_to("notexample.com"));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn establishes_authenticated_http_connect_tunnels() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let proxy = ProxyConfig::new(format!("http://user:pass@{address}"));
+            let _stream = connect_proxy(&proxy, "example.com", 443).await.unwrap();
+            let request = server.await.unwrap();
+            assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+            assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+        }
     }
 }
 
@@ -211,7 +503,9 @@ mod native {
 mod managed;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{NativeConnector, NativeTimer, NativeTransport};
+pub use native::{
+    NativeConnector, NativeTimer, NativeTransport, NativeTransportOptions, ProxyConfig,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use managed::*;

@@ -13,13 +13,14 @@ mod web {
         ConnectContext, Connector, Endpoint, ResolvedEndpoint, Socket, SocketStatus, Timer,
     };
     use phoenix_channel_runtime::{
-        Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
+        Transport, TransportClose, TransportCloseRequest, TransportError, TransportErrorKind,
+        TransportEvent, WireMessage,
     };
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use web_sys::{Event, VisibilityState, Window};
 
     pub struct WebTransport {
-        inner: WebSocket,
+        inner: Option<WebSocket>,
     }
 
     pub struct WebLifecycle {
@@ -217,7 +218,7 @@ mod web {
             let inner = WebSocket::open(url).map_err(|error| {
                 TransportError::with_kind(TransportErrorKind::Connect, format!("{error:?}"))
             })?;
-            Ok(Self { inner })
+            Ok(Self { inner: Some(inner) })
         }
 
         async fn connect_resolved(endpoint: ResolvedEndpoint) -> Result<Self, TransportError> {
@@ -240,7 +241,7 @@ mod web {
                     "WebSocket closed before the open event",
                 ));
             }
-            Ok(Self { inner })
+            Ok(Self { inner: Some(inner) })
         }
     }
 
@@ -254,9 +255,14 @@ mod web {
                     WireMessage::Text(text) => Message::Text(text),
                     WireMessage::Binary(bytes) => Message::Bytes(bytes),
                 };
-                self.inner.send(message).await.map_err(|error| {
-                    TransportError::with_kind(TransportErrorKind::Send, format!("{error:?}"))
-                })
+                self.inner
+                    .as_mut()
+                    .ok_or_else(closed_error)?
+                    .send(message)
+                    .await
+                    .map_err(|error| {
+                        TransportError::with_kind(TransportErrorKind::Send, format!("{error:?}"))
+                    })
             })
         }
 
@@ -264,7 +270,8 @@ mod web {
             &'a mut self,
         ) -> futures::future::LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
             Box::pin(async move {
-                let Some(message) = self.inner.next().await else {
+                let Some(message) = self.inner.as_mut().ok_or_else(closed_error)?.next().await
+                else {
                     return Ok(TransportEvent::Closed(TransportClose::connection_ended()));
                 };
                 match message {
@@ -287,11 +294,34 @@ mod web {
             &'a mut self,
         ) -> futures::future::LocalBoxFuture<'a, Result<(), TransportError>> {
             Box::pin(async move {
-                SinkExt::close(&mut self.inner).await.map_err(|error| {
+                let Some(inner) = self.inner.take() else {
+                    return Ok(());
+                };
+                inner.close(None, None).map_err(|error| {
                     TransportError::with_kind(TransportErrorKind::Close, format!("{error:?}"))
                 })
             })
         }
+
+        fn close_with<'a>(
+            &'a mut self,
+            request: TransportCloseRequest,
+        ) -> futures::future::LocalBoxFuture<'a, Result<(), TransportError>> {
+            Box::pin(async move {
+                let Some(inner) = self.inner.take() else {
+                    return Ok(());
+                };
+                inner
+                    .close(Some(request.code), Some(&request.reason))
+                    .map_err(|error| {
+                        TransportError::with_kind(TransportErrorKind::Close, format!("{error:?}"))
+                    })
+            })
+        }
+    }
+
+    fn closed_error() -> TransportError {
+        TransportError::with_kind(TransportErrorKind::Other, "WebSocket is closed")
     }
 }
 
