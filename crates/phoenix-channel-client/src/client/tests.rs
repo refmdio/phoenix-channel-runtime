@@ -195,6 +195,34 @@ fn stops_after_a_clean_transport_close() {
 }
 
 #[test]
+fn bounded_event_subscribers_report_dropped_events() {
+    let (sender, mut receiver) = mpsc::channel(2);
+    let mut subscriber = EventSubscriber { sender, dropped: 0 };
+
+    assert!(send_bounded(&mut subscriber, SocketEvent::Connected));
+    assert!(send_bounded(&mut subscriber, SocketEvent::Connected));
+    assert!(send_bounded(&mut subscriber, SocketEvent::Connected));
+    assert!(send_bounded(&mut subscriber, SocketEvent::Connected));
+    assert_eq!(subscriber.dropped, 1);
+
+    let mut pool = LocalPool::new();
+    pool.run_until(async {
+        assert_eq!(receiver.next().await, Some(SocketEvent::Connected));
+        assert_eq!(receiver.next().await, Some(SocketEvent::Connected));
+        assert_eq!(receiver.next().await, Some(SocketEvent::Connected));
+    });
+
+    assert!(send_bounded(&mut subscriber, SocketEvent::Connected));
+    pool.run_until(async {
+        assert_eq!(
+            receiver.next().await,
+            Some(SocketEvent::Lagged { dropped: 1 })
+        );
+        assert_eq!(receiver.next().await, Some(SocketEvent::Connected));
+    });
+}
+
+#[test]
 fn explicitly_connects_disconnects_and_connects_again() {
     let (first, _first_peer) = connection();
     let (second, _second_peer) = connection();
@@ -204,6 +232,7 @@ fn explicitly_connects_disconnects_and_connects_again() {
     let mut pool = LocalPool::new();
     let (socket, driver) = Socket::new(connector, timer, options);
     let mut events = socket.events().unwrap();
+    let mut statuses = socket.status_changes();
     assert_eq!(socket.status(), SocketStatus::Disconnected);
     pool.spawner().spawn_local(driver).unwrap();
 
@@ -214,6 +243,7 @@ fn explicitly_connects_disconnects_and_connects_again() {
             Some(SocketEvent::Connecting { attempt: 0 })
         );
         assert_eq!(events.next().await, Some(SocketEvent::Connected));
+        assert_eq!(statuses.changed().await, Some(SocketStatus::Connected));
 
         socket.disconnect().await.unwrap();
         assert_eq!(
@@ -223,6 +253,7 @@ fn explicitly_connects_disconnects_and_connects_again() {
             })
         );
         assert_eq!(socket.status(), SocketStatus::Disconnected);
+        assert_eq!(statuses.changed().await, Some(SocketStatus::Disconnected));
 
         socket.connect().await.unwrap();
         assert_eq!(
@@ -233,6 +264,19 @@ fn explicitly_connects_disconnects_and_connects_again() {
         socket.shutdown().await.unwrap();
         assert_eq!(events.next().await, Some(SocketEvent::Closed));
     });
+}
+
+#[test]
+fn configures_operation_timeouts_independently() {
+    let options = Options::default()
+        .join_timeout(Duration::from_secs(11))
+        .call_timeout(Duration::from_secs(12))
+        .leave_timeout(Duration::from_secs(13))
+        .event_capacity(7);
+    assert_eq!(options.join_timeout, Duration::from_secs(11));
+    assert_eq!(options.call_timeout, Duration::from_secs(12));
+    assert_eq!(options.leave_timeout, Duration::from_secs(13));
+    assert_eq!(options.event_capacity, 7);
 }
 
 #[test]
@@ -333,7 +377,12 @@ fn interrupts_a_transmitted_call_on_disconnect() {
             peer.incoming.take();
         };
         let ((), result) = futures::join!(disconnect, channel.call("save", json!({"value": 1})));
-        assert_eq!(result.unwrap_err(), ClientError::Interrupted);
+        assert_eq!(
+            result.unwrap_err(),
+            ClientError::Interrupted {
+                operation: ClientOperation::Call,
+            }
+        );
     });
 }
 
@@ -535,7 +584,13 @@ fn retries_a_join_after_its_wire_request_times_out() {
         assert_ne!(second_join.join_ref, first_join.join_ref);
         reply(&peer, &second_join, "ok", json!({"attempt": 2}));
 
-        assert_eq!(joined.await.unwrap().unwrap_err(), ClientError::Timeout);
+        assert_eq!(
+            joined.await.unwrap().unwrap_err(),
+            ClientError::Timeout {
+                operation: ClientOperation::Join,
+                timeout: request_timeout,
+            }
+        );
         loop {
             if matches!(
                 channel.next_event().await,
@@ -646,7 +701,13 @@ fn times_out_and_removes_an_unsent_call() {
             }
         };
         let (result, ()) = futures::join!(channel.call("never_sent", json!({})), fire_timeout);
-        assert_eq!(result.unwrap_err(), ClientError::Timeout);
+        assert_eq!(
+            result.unwrap_err(),
+            ClientError::Timeout {
+                operation: ClientOperation::Call,
+                timeout: request_timeout,
+            }
+        );
 
         let server = async {
             let join = next_frame(&mut peer).await;
@@ -829,7 +890,12 @@ fn leaving_while_joining_sends_leave_after_the_join_reply() {
                 channel.leave().await
             };
             let (joined, left) = futures::join!(join, leave);
-            assert_eq!(joined.unwrap_err(), ClientError::Interrupted);
+            assert_eq!(
+                joined.unwrap_err(),
+                ClientError::Interrupted {
+                    operation: ClientOperation::Join,
+                }
+            );
             left.unwrap();
             assert_eq!(channel.status(), ChannelStatus::Left);
         };
@@ -879,7 +945,12 @@ fn ignores_a_stale_join_payload_after_leave_and_rejoin() {
             joined.unwrap();
         };
         let (first_result, ()) = futures::join!(first_join, replace_join);
-        assert_eq!(first_result.unwrap_err(), ClientError::Interrupted);
+        assert_eq!(
+            first_result.unwrap_err(),
+            ClientError::Interrupted {
+                operation: ClientOperation::Join,
+            }
+        );
         assert_eq!(channel.status(), ChannelStatus::Joined);
         socket.shutdown().await.unwrap();
     });
@@ -1048,7 +1119,13 @@ fn continues_a_queued_rejoin_after_leave_times_out() {
         assert_eq!(second_join.event, "phx_join");
         reply(&peer, &second_join, "ok", json!({"generation": 2}));
 
-        assert_eq!(left.await.unwrap().unwrap_err(), ClientError::Timeout);
+        assert_eq!(
+            left.await.unwrap().unwrap_err(),
+            ClientError::Timeout {
+                operation: ClientOperation::Leave,
+                timeout: request_timeout,
+            }
+        );
         assert_eq!(rejoined.await.unwrap().unwrap(), json!({"generation": 2}));
         assert_eq!(channel.status(), ChannelStatus::Joined);
         socket.shutdown().await.unwrap();

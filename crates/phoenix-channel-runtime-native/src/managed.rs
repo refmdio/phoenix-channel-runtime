@@ -46,7 +46,9 @@ pub struct NativeOptions {
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
     connect_timeout: Duration,
-    request_timeout: Duration,
+    join_timeout: Duration,
+    call_timeout: Duration,
+    leave_timeout: Duration,
     reconnect_delays: Vec<Duration>,
     rejoin_delays: Vec<Duration>,
     command_capacity: usize,
@@ -67,7 +69,9 @@ impl Default for NativeOptions {
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
+            join_timeout: Duration::from_secs(10),
+            call_timeout: Duration::from_secs(10),
+            leave_timeout: Duration::from_secs(10),
             reconnect_delays: retry_delays.clone(),
             rejoin_delays: retry_delays,
             command_capacity: 64,
@@ -94,7 +98,24 @@ impl NativeOptions {
     }
 
     pub fn request_timeout(mut self, value: Duration) -> Self {
-        self.request_timeout = value;
+        self.join_timeout = value;
+        self.call_timeout = value;
+        self.leave_timeout = value;
+        self
+    }
+
+    pub fn join_timeout(mut self, value: Duration) -> Self {
+        self.join_timeout = value;
+        self
+    }
+
+    pub fn call_timeout(mut self, value: Duration) -> Self {
+        self.call_timeout = value;
+        self
+    }
+
+    pub fn leave_timeout(mut self, value: Duration) -> Self {
+        self.leave_timeout = value;
         self
     }
 
@@ -131,7 +152,10 @@ impl NativeOptions {
             .heartbeat_interval(self.heartbeat_interval)
             .heartbeat_timeout(self.heartbeat_timeout)
             .connect_timeout(self.connect_timeout)
-            .request_timeout(self.request_timeout)
+            .join_timeout(self.join_timeout)
+            .call_timeout(self.call_timeout)
+            .leave_timeout(self.leave_timeout)
+            .event_capacity(self.event_capacity)
             .reconnect_delay(move |attempt| retry_delay(&reconnect_delays, attempt))
             .rejoin_delay(move |attempt| retry_delay(&rejoin_delays, attempt))
             .command_capacity(self.command_capacity)
@@ -582,6 +606,7 @@ async fn worker_main(
     let mut socket_events = socket
         .events()
         .expect("new socket event subscription should succeed");
+    let mut socket_statuses = socket.status_changes();
     tokio::task::spawn_local(driver);
     let next_id = AtomicU64::new(1);
     let mut channels: HashMap<u64, Rc<Channel>> = HashMap::new();
@@ -590,8 +615,13 @@ async fn worker_main(
         tokio::select! {
             event = socket_events.next() => match event {
                 Some(event) => {
-                    status.send_replace(socket.status());
                     let _ = events.send(event);
+                }
+                None => break,
+            },
+            changed = socket_statuses.changed() => match changed {
+                Some(changed) => {
+                    status.send_replace(changed);
                 }
                 None => break,
             },
@@ -655,6 +685,7 @@ async fn handle_host_command(
                     let channel = Rc::new(channel);
                     let (event_tx, _) = broadcast::channel(event_capacity);
                     let (status_tx, status_rx) = watch::channel(channel.status());
+                    let mut status_changes = channel.status_changes();
                     let mut event_rx = match channel.events() {
                         Ok(events) => events,
                         Err(error) => {
@@ -662,12 +693,15 @@ async fn handle_host_command(
                             return false;
                         }
                     };
-                    let event_channel = channel.clone();
                     let pump_tx = event_tx.clone();
                     tokio::task::spawn_local(async move {
                         while let Some(event) = event_rx.next().await {
-                            status_tx.send_replace(event_channel.status());
                             let _ = pump_tx.send(event);
+                        }
+                    });
+                    tokio::task::spawn_local(async move {
+                        while let Some(changed) = status_changes.changed().await {
+                            status_tx.send_replace(changed);
                         }
                     });
                     channels.insert(id, channel);

@@ -43,6 +43,7 @@ pub enum SocketEvent {
     Disconnected { reason: DisconnectReason },
     ReconnectScheduled { attempt: u32, delay: Duration },
     Closed,
+    Lagged { dropped: u64 },
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -89,6 +90,7 @@ pub enum ChannelEvent {
     Protocol(ProtocolEvent),
     Disconnected,
     JoinPayloadError(String),
+    Lagged { dropped: u64 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,6 +111,25 @@ pub struct Reply {
     pub response: Value,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientOperation {
+    Join,
+    Call,
+    Cast,
+    Leave,
+}
+
+impl std::fmt::Display for ClientOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Join => "join",
+            Self::Call => "call",
+            Self::Cast => "cast",
+            Self::Leave => "leave",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ClientError {
     #[error("the managed client driver stopped")]
@@ -119,17 +140,79 @@ pub enum ClientError {
     PushBufferFull(String),
     #[error("a channel already exists for topic {0}")]
     DuplicateChannel(String),
-    #[error("request timed out")]
-    Timeout,
-    #[error("request was interrupted by connection loss")]
-    Interrupted,
+    #[error("{operation} timed out after {timeout:?}")]
+    Timeout {
+        operation: ClientOperation,
+        timeout: Duration,
+    },
+    #[error("{operation} was interrupted by connection loss")]
+    Interrupted { operation: ClientOperation },
     #[error("protocol error: {0}")]
     Protocol(String),
-    #[error("join payload loader failed: {0}")]
-    JoinPayload(String),
-    #[error("channel join was rejected: {0}")]
-    JoinRejected(Value),
+    #[error("join payload loader failed for {topic}: {message}")]
+    JoinPayload { topic: String, message: String },
+    #[error("channel join was rejected for {topic}: {response}")]
+    JoinRejected { topic: String, response: Value },
+    #[error("unknown channel topic: {0}")]
+    UnknownTopic(String),
 }
+
+struct ObservableStatus<T> {
+    value: Cell<T>,
+    subscribers: RefCell<Vec<mpsc::Sender<()>>>,
+}
+
+impl<T: Copy + Eq> ObservableStatus<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: Cell::new(value),
+            subscribers: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn get(&self) -> T {
+        self.value.get()
+    }
+
+    fn set(&self, value: T) {
+        if self.value.replace(value) == value {
+            return;
+        }
+        self.subscribers
+            .borrow_mut()
+            .retain_mut(|subscriber| match subscriber.try_send(()) {
+                Ok(()) => true,
+                Err(error) => error.is_full(),
+            });
+    }
+
+    fn subscribe(self: &Rc<Self>) -> StatusChanges<T> {
+        let (sender, receiver) = mpsc::channel(1);
+        self.subscribers.borrow_mut().push(sender);
+        StatusChanges {
+            receiver,
+            status: self.clone(),
+        }
+    }
+}
+
+pub struct StatusChanges<T> {
+    receiver: mpsc::Receiver<()>,
+    status: Rc<ObservableStatus<T>>,
+}
+
+impl<T: Copy + Eq> StatusChanges<T> {
+    pub fn current(&self) -> T {
+        self.status.get()
+    }
+
+    pub async fn changed(&mut self) -> Option<T> {
+        self.receiver.next().await.map(|()| self.status.get())
+    }
+}
+
+pub type SocketStatusChanges = StatusChanges<SocketStatus>;
+pub type ChannelStatusChanges = StatusChanges<ChannelStatus>;
 
 #[derive(Clone)]
 pub struct Socket {
@@ -139,7 +222,7 @@ pub struct Socket {
     options: Options,
     request_ids: Rc<Cell<RequestId>>,
     topics: Rc<RefCell<HashSet<String>>>,
-    status: Rc<Cell<SocketStatus>>,
+    status: Rc<ObservableStatus<SocketStatus>>,
 }
 
 impl Socket {
@@ -151,7 +234,7 @@ impl Socket {
         let (commands, command_rx) = mpsc::channel(options.command_capacity);
         let (lifecycle, lifecycle_rx) = mpsc::unbounded();
         let timer: Rc<dyn Timer> = Rc::new(timer);
-        let status = Rc::new(Cell::new(if options.connect_on_start {
+        let status = Rc::new(ObservableStatus::new(if options.connect_on_start {
             SocketStatus::Connecting
         } else {
             SocketStatus::Disconnected
@@ -188,8 +271,8 @@ impl Socket {
         if !self.topics.borrow_mut().insert(topic.clone()) {
             return Err(ClientError::DuplicateChannel(topic));
         }
-        let (events, event_rx) = mpsc::unbounded();
-        let status = Rc::new(Cell::new(ChannelStatus::Closed));
+        let (events, event_rx) = mpsc::channel(self.options.event_capacity);
+        let status = Rc::new(ObservableStatus::new(ChannelStatus::Closed));
         if self
             .lifecycle
             .unbounded_send(LifecycleCommand::Register {
@@ -208,7 +291,12 @@ impl Socket {
             commands: self.commands.clone(),
             lifecycle: self.lifecycle.clone(),
             timer: self.timer.clone(),
-            timeout: self.options.request_timeout,
+            timeouts: OperationTimeouts {
+                join: self.options.join_timeout,
+                call: self.options.call_timeout,
+                leave: self.options.leave_timeout,
+            },
+            event_capacity: self.options.event_capacity,
             request_ids: self.request_ids.clone(),
             topics: self.topics.clone(),
             events: event_rx,
@@ -217,7 +305,7 @@ impl Socket {
     }
 
     pub fn events(&self) -> Result<SocketEvents, ClientError> {
-        let (events, receiver) = mpsc::unbounded();
+        let (events, receiver) = mpsc::channel(self.options.event_capacity);
         let mut commands = self.commands.clone();
         commands
             .try_send(Command::Subscribe { events })
@@ -227,6 +315,10 @@ impl Socket {
 
     pub fn status(&self) -> SocketStatus {
         self.status.get()
+    }
+
+    pub fn status_changes(&self) -> SocketStatusChanges {
+        self.status.subscribe()
     }
 
     pub async fn connect(&self) -> Result<(), ClientError> {
@@ -261,7 +353,7 @@ impl Socket {
 }
 
 pub struct SocketEvents {
-    receiver: mpsc::UnboundedReceiver<SocketEvent>,
+    receiver: mpsc::Receiver<SocketEvent>,
 }
 
 impl SocketEvents {
@@ -275,11 +367,19 @@ pub struct Channel {
     commands: mpsc::Sender<Command>,
     lifecycle: mpsc::UnboundedSender<LifecycleCommand>,
     timer: Rc<dyn Timer>,
-    timeout: Duration,
+    timeouts: OperationTimeouts,
+    event_capacity: usize,
     request_ids: Rc<Cell<RequestId>>,
     topics: Rc<RefCell<HashSet<String>>>,
-    events: mpsc::UnboundedReceiver<ChannelEvent>,
-    status: Rc<Cell<ChannelStatus>>,
+    events: mpsc::Receiver<ChannelEvent>,
+    status: Rc<ObservableStatus<ChannelStatus>>,
+}
+
+#[derive(Clone, Copy)]
+struct OperationTimeouts {
+    join: Duration,
+    call: Duration,
+    leave: Duration,
 }
 
 impl Channel {
@@ -291,6 +391,10 @@ impl Channel {
         self.status.get()
     }
 
+    pub fn status_changes(&self) -> ChannelStatusChanges {
+        self.status.subscribe()
+    }
+
     pub async fn join(&self) -> Result<Value, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -300,7 +404,8 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, receiver).await
+        self.wait(id, ClientOperation::Join, self.timeouts.join, receiver)
+            .await
     }
 
     pub async fn call(
@@ -318,7 +423,8 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, receiver).await
+        self.wait(id, ClientOperation::Call, self.timeouts.call, receiver)
+            .await
     }
 
     /// Sends an event without asking Phoenix for a reply.
@@ -333,7 +439,8 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, receiver).await
+        self.wait(id, ClientOperation::Cast, self.timeouts.call, receiver)
+            .await
     }
 
     pub async fn leave(&self) -> Result<Value, ClientError> {
@@ -345,7 +452,8 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, receiver).await
+        self.wait(id, ClientOperation::Leave, self.timeouts.leave, receiver)
+            .await
     }
 
     pub async fn next_event(&mut self) -> Option<ChannelEvent> {
@@ -353,7 +461,7 @@ impl Channel {
     }
 
     pub fn events(&self) -> Result<ChannelEvents, ClientError> {
-        let (events, receiver) = mpsc::unbounded();
+        let (events, receiver) = mpsc::channel(self.event_capacity);
         let mut commands = self.commands.clone();
         commands
             .try_send(Command::SubscribeChannel {
@@ -384,6 +492,8 @@ impl Channel {
     async fn wait<T>(
         &self,
         id: RequestId,
+        operation: ClientOperation,
+        timeout_duration: Duration,
         receiver: oneshot::Receiver<Result<T, ClientError>>,
     ) -> Result<T, ClientError> {
         let mut guard = RequestGuard {
@@ -392,20 +502,23 @@ impl Channel {
             armed: true,
         };
         let response = receiver.fuse();
-        let timeout = self.timer.sleep(self.timeout).fuse();
+        let timeout = self.timer.sleep(timeout_duration).fuse();
         futures::pin_mut!(response, timeout);
         futures::select! {
             response = response => {
                 guard.armed = false;
                 response.map_err(|_| ClientError::DriverStopped)?
             },
-            () = timeout => Err(ClientError::Timeout),
+            () = timeout => Err(ClientError::Timeout {
+                operation,
+                timeout: timeout_duration,
+            }),
         }
     }
 }
 
 pub struct ChannelEvents {
-    receiver: mpsc::UnboundedReceiver<ChannelEvent>,
+    receiver: mpsc::Receiver<ChannelEvent>,
 }
 
 impl ChannelEvents {
@@ -468,8 +581,8 @@ enum LifecycleCommand {
     Register {
         topic: String,
         payload_loader: JoinPayloadLoader,
-        events: mpsc::UnboundedSender<ChannelEvent>,
-        status: Rc<Cell<ChannelStatus>>,
+        events: mpsc::Sender<ChannelEvent>,
+        status: Rc<ObservableStatus<ChannelStatus>>,
     },
     Unregister {
         topic: String,
@@ -487,11 +600,11 @@ enum Command {
         response: oneshot::Sender<()>,
     },
     Subscribe {
-        events: mpsc::UnboundedSender<SocketEvent>,
+        events: mpsc::Sender<SocketEvent>,
     },
     SubscribeChannel {
         topic: String,
-        events: mpsc::UnboundedSender<ChannelEvent>,
+        events: mpsc::Sender<ChannelEvent>,
     },
     Join {
         id: RequestId,
@@ -545,7 +658,11 @@ impl QueuedPush {
     }
 
     fn interrupt(self) {
-        self.fail(ClientError::Interrupted);
+        let operation = match &self {
+            Self::Call { .. } => ClientOperation::Call,
+            Self::Cast { .. } => ClientOperation::Cast,
+        };
+        self.fail(ClientError::Interrupted { operation });
     }
 
     fn fail(self, error: ClientError) {
@@ -562,8 +679,8 @@ impl QueuedPush {
 
 struct ChannelRecord {
     payload_loader: JoinPayloadLoader,
-    subscribers: Vec<mpsc::UnboundedSender<ChannelEvent>>,
-    status: Rc<Cell<ChannelStatus>>,
+    subscribers: Vec<EventSubscriber<ChannelEvent>>,
+    status: Rc<ObservableStatus<ChannelStatus>>,
     desired: bool,
     ever_joined: bool,
     active_payload: Option<u64>,
@@ -572,6 +689,11 @@ struct ChannelRecord {
     join_waiters: HashMap<RequestId, oneshot::Sender<Result<Value, ClientError>>>,
     queued: VecDeque<QueuedPush>,
     deferred_leave: Option<PendingLeave>,
+}
+
+struct EventSubscriber<T> {
+    sender: mpsc::Sender<T>,
+    dropped: u64,
 }
 
 struct PendingCall {
@@ -599,12 +721,12 @@ struct DriverState {
     lifecycle: mpsc::UnboundedReceiver<LifecycleCommand>,
     protocol: Protocol,
     channels: HashMap<String, ChannelRecord>,
-    socket_subscribers: Vec<mpsc::UnboundedSender<SocketEvent>>,
+    socket_subscribers: Vec<EventSubscriber<SocketEvent>>,
     pending_joins: HashMap<String, String>,
     pending_calls: HashMap<String, PendingCall>,
     pending_leaves: HashMap<String, PendingLeave>,
     next_payload_id: u64,
-    socket_status: Rc<Cell<SocketStatus>>,
+    socket_status: Rc<ObservableStatus<SocketStatus>>,
 }
 
 impl DriverState {
@@ -614,7 +736,7 @@ impl DriverState {
         options: Options,
         commands: mpsc::Receiver<Command>,
         lifecycle: mpsc::UnboundedReceiver<LifecycleCommand>,
-        socket_status: Rc<Cell<SocketStatus>>,
+        socket_status: Rc<ObservableStatus<SocketStatus>>,
     ) -> Self {
         Self {
             connector,
@@ -1008,7 +1130,10 @@ impl DriverState {
             Command::Connect { .. } | Command::Disconnect { .. } => {
                 unreachable!("connection controls are handled by the driver loop")
             }
-            Command::Subscribe { events } => self.socket_subscribers.push(events),
+            Command::Subscribe { events } => self.socket_subscribers.push(EventSubscriber {
+                sender: events,
+                dropped: 0,
+            }),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
             Command::Join {
                 id,
@@ -1020,9 +1145,7 @@ impl DriverState {
                     channel.status.set(ChannelStatus::WaitingForSocket);
                     channel.join_waiters.insert(id, response);
                 } else {
-                    let _ = response.send(Err(ClientError::Protocol(format!(
-                        "unknown topic: {topic}"
-                    ))));
+                    let _ = response.send(Err(ClientError::UnknownTopic(topic)));
                 }
             }
             Command::Call {
@@ -1111,7 +1234,10 @@ impl DriverState {
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
     ) -> Result<(), DisconnectReason> {
         match command {
-            Command::Subscribe { events } => self.socket_subscribers.push(events),
+            Command::Subscribe { events } => self.socket_subscribers.push(EventSubscriber {
+                sender: events,
+                dropped: 0,
+            }),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
             Command::Join {
                 id,
@@ -1130,9 +1256,7 @@ impl DriverState {
                         self.load_payload(&topic, payloads);
                     }
                 } else {
-                    let _ = response.send(Err(ClientError::Protocol(format!(
-                        "unknown topic: {topic}"
-                    ))));
+                    let _ = response.send(Err(ClientError::UnknownTopic(topic)));
                 }
             }
             Command::Call {
@@ -1234,12 +1358,15 @@ impl DriverState {
         &mut self,
         topic: String,
         payload_loader: JoinPayloadLoader,
-        events: mpsc::UnboundedSender<ChannelEvent>,
-        status: Rc<Cell<ChannelStatus>>,
+        events: mpsc::Sender<ChannelEvent>,
+        status: Rc<ObservableStatus<ChannelStatus>>,
     ) {
         self.channels.entry(topic).or_insert(ChannelRecord {
             payload_loader,
-            subscribers: vec![events],
+            subscribers: vec![EventSubscriber {
+                sender: events,
+                dropped: 0,
+            }],
             status,
             desired: false,
             ever_joined: false,
@@ -1252,9 +1379,12 @@ impl DriverState {
         });
     }
 
-    fn subscribe_channel(&mut self, topic: &str, events: mpsc::UnboundedSender<ChannelEvent>) {
+    fn subscribe_channel(&mut self, topic: &str, events: mpsc::Sender<ChannelEvent>) {
         if let Some(channel) = self.channels.get_mut(topic) {
-            channel.subscribers.push(events);
+            channel.subscribers.push(EventSubscriber {
+                sender: events,
+                dropped: 0,
+            });
         }
     }
 
@@ -1336,7 +1466,10 @@ impl DriverState {
                 channel.desired = false;
                 channel.status.set(ChannelStatus::Errored);
                 for (_, waiter) in channel.join_waiters.drain() {
-                    let _ = waiter.send(Err(ClientError::JoinPayload(error.clone())));
+                    let _ = waiter.send(Err(ClientError::JoinPayload {
+                        topic: topic.clone(),
+                        message: error.clone(),
+                    }));
                 }
                 self.emit_channel(&topic, ChannelEvent::JoinPayloadError(error));
                 return Ok(());
@@ -1445,7 +1578,10 @@ impl DriverState {
                         channel.status.set(ChannelStatus::Left);
                     }
                     for (_, waiter) in channel.join_waiters.drain() {
-                        let _ = waiter.send(Err(ClientError::JoinRejected(response.clone())));
+                        let _ = waiter.send(Err(ClientError::JoinRejected {
+                            topic: topic.clone(),
+                            response: response.clone(),
+                        }));
                     }
                 }
                 self.emit_channel(topic, ChannelEvent::Protocol(event.clone()));
@@ -1560,7 +1696,10 @@ impl DriverState {
         timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
     ) {
         let timer = self.timer.clone();
-        let timeout = self.options.request_timeout;
+        let timeout = match operation {
+            OperationTimeout::Join { .. } => self.options.join_timeout,
+            OperationTimeout::Leave { .. } => self.options.leave_timeout,
+        };
         timeouts.push(Box::pin(async move {
             timer.sleep(timeout).await;
             operation
@@ -1584,13 +1723,19 @@ impl DriverState {
                     channel.active_payload = None;
                     if let Some(pending) = channel.deferred_leave.take() {
                         if let Some(response) = pending.response {
-                            let _ = response.send(Err(ClientError::Timeout));
+                            let _ = response.send(Err(ClientError::Timeout {
+                                operation: ClientOperation::Leave,
+                                timeout: self.options.leave_timeout,
+                            }));
                         }
                         channel.status.set(ChannelStatus::Left);
                     } else if channel.desired {
                         channel.status.set(ChannelStatus::Errored);
                         for (_, waiter) in channel.join_waiters.drain() {
-                            let _ = waiter.send(Err(ClientError::Timeout));
+                            let _ = waiter.send(Err(ClientError::Timeout {
+                                operation: ClientOperation::Join,
+                                timeout: self.options.join_timeout,
+                            }));
                         }
                         should_rejoin = true;
                     } else {
@@ -1606,7 +1751,10 @@ impl DriverState {
                     return Ok(());
                 };
                 if let Some(response) = pending.response {
-                    let _ = response.send(Err(ClientError::Timeout));
+                    let _ = response.send(Err(ClientError::Timeout {
+                        operation: ClientOperation::Leave,
+                        timeout: self.options.leave_timeout,
+                    }));
                 }
                 self.protocol.discard_channel(&topic);
                 let should_rejoin = self
@@ -1682,7 +1830,9 @@ impl DriverState {
                         Ok(())
                     }
                     Err(error) => {
-                        let _ = response.send(Err(ClientError::Interrupted));
+                        let _ = response.send(Err(ClientError::Interrupted {
+                            operation: ClientOperation::Cast,
+                        }));
                         Err(error)
                     }
                 }
@@ -1746,11 +1896,15 @@ impl DriverState {
             channel.rejoin_scheduled = false;
             if let Some(pending) = channel.deferred_leave.take() {
                 if let Some(response) = pending.response {
-                    let _ = response.send(Err(ClientError::Interrupted));
+                    let _ = response.send(Err(ClientError::Interrupted {
+                        operation: ClientOperation::Leave,
+                    }));
                 }
             }
             for (_, waiter) in channel.join_waiters.drain() {
-                let _ = waiter.send(Err(ClientError::Interrupted));
+                let _ = waiter.send(Err(ClientError::Interrupted {
+                    operation: ClientOperation::Join,
+                }));
             }
             for push in channel.queued.drain(..) {
                 push.interrupt();
@@ -1762,11 +1916,15 @@ impl DriverState {
         let events = self.protocol.reset_connection();
         self.pending_joins.clear();
         for (_, pending) in self.pending_calls.drain() {
-            let _ = pending.response.send(Err(ClientError::Interrupted));
+            let _ = pending.response.send(Err(ClientError::Interrupted {
+                operation: ClientOperation::Call,
+            }));
         }
         for (_, pending) in self.pending_leaves.drain() {
             if let Some(response) = pending.response {
-                let _ = response.send(Err(ClientError::Interrupted));
+                let _ = response.send(Err(ClientError::Interrupted {
+                    operation: ClientOperation::Leave,
+                }));
             }
         }
         let topics = self.channels.keys().cloned().collect::<Vec<_>>();
@@ -1775,7 +1933,9 @@ impl DriverState {
             channel.rejoin_scheduled = false;
             if let Some(pending) = channel.deferred_leave.take() {
                 if let Some(response) = pending.response {
-                    let _ = response.send(Err(ClientError::Interrupted));
+                    let _ = response.send(Err(ClientError::Interrupted {
+                        operation: ClientOperation::Leave,
+                    }));
                 }
             }
             let status = if channel.desired {
@@ -1809,6 +1969,7 @@ impl DriverState {
                 SocketStatus::WaitingToReconnect
             }
             SocketEvent::Closed => SocketStatus::Closed,
+            SocketEvent::Lagged { .. } => self.socket_status.get(),
         };
         self.socket_status.set(status);
         if status == SocketStatus::Closed {
@@ -1817,15 +1978,52 @@ impl DriverState {
             }
         }
         self.socket_subscribers
-            .retain(|subscriber| subscriber.unbounded_send(event.clone()).is_ok());
+            .retain_mut(|subscriber| send_bounded(subscriber, event.clone()));
     }
 
     fn emit_channel(&mut self, topic: &str, event: ChannelEvent) {
         if let Some(channel) = self.channels.get_mut(topic) {
             channel
                 .subscribers
-                .retain(|subscriber| subscriber.unbounded_send(event.clone()).is_ok());
+                .retain_mut(|subscriber| send_bounded(subscriber, event.clone()));
         }
+    }
+}
+
+trait LaggedEvent {
+    fn lagged(dropped: u64) -> Self;
+}
+
+impl LaggedEvent for SocketEvent {
+    fn lagged(dropped: u64) -> Self {
+        Self::Lagged { dropped }
+    }
+}
+
+impl LaggedEvent for ChannelEvent {
+    fn lagged(dropped: u64) -> Self {
+        Self::Lagged { dropped }
+    }
+}
+
+fn send_bounded<T: Clone + LaggedEvent>(subscriber: &mut EventSubscriber<T>, event: T) -> bool {
+    if subscriber.dropped > 0 {
+        match subscriber.sender.try_send(T::lagged(subscriber.dropped)) {
+            Ok(()) => subscriber.dropped = 0,
+            Err(error) if error.is_full() => {
+                subscriber.dropped = subscriber.dropped.saturating_add(1);
+                return true;
+            }
+            Err(_) => return false,
+        }
+    }
+    match subscriber.sender.try_send(event) {
+        Ok(()) => true,
+        Err(error) if error.is_full() => {
+            subscriber.dropped = 1;
+            true
+        }
+        Err(_) => false,
     }
 }
 

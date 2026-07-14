@@ -43,11 +43,14 @@ pub struct Options {
     pub(crate) heartbeat_interval: Duration,
     pub(crate) heartbeat_timeout: Duration,
     pub(crate) connect_timeout: Duration,
-    pub(crate) request_timeout: Duration,
+    pub(crate) join_timeout: Duration,
+    pub(crate) call_timeout: Duration,
+    pub(crate) leave_timeout: Duration,
     pub(crate) reconnect_delay: Rc<dyn Fn(u32) -> Duration>,
     pub(crate) rejoin_delay: Rc<dyn Fn(u32) -> Duration>,
     pub(crate) command_capacity: usize,
     pub(crate) push_buffer_capacity: usize,
+    pub(crate) event_capacity: usize,
     pub(crate) connect_on_start: bool,
 }
 
@@ -57,11 +60,14 @@ impl Default for Options {
             heartbeat_interval: Duration::from_secs(30),
             heartbeat_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
+            join_timeout: Duration::from_secs(10),
+            call_timeout: Duration::from_secs(10),
+            leave_timeout: Duration::from_secs(10),
             reconnect_delay: Rc::new(default_retry_delay),
             rejoin_delay: Rc::new(default_retry_delay),
             command_capacity: 64,
             push_buffer_capacity: 64,
+            event_capacity: 256,
             connect_on_start: true,
         }
     }
@@ -84,7 +90,24 @@ impl Options {
     }
 
     pub fn request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
+        self.join_timeout = timeout;
+        self.call_timeout = timeout;
+        self.leave_timeout = timeout;
+        self
+    }
+
+    pub fn join_timeout(mut self, timeout: Duration) -> Self {
+        self.join_timeout = timeout;
+        self
+    }
+
+    pub fn call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
+    }
+
+    pub fn leave_timeout(mut self, timeout: Duration) -> Self {
+        self.leave_timeout = timeout;
         self
     }
 
@@ -105,6 +128,11 @@ impl Options {
 
     pub fn push_buffer_capacity(mut self, capacity: usize) -> Self {
         self.push_buffer_capacity = capacity;
+        self
+    }
+
+    pub fn event_capacity(mut self, capacity: usize) -> Self {
+        self.event_capacity = capacity.max(1);
         self
     }
 
