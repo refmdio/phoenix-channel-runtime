@@ -14,7 +14,7 @@ categories = ["asynchronous", "network-programming", "web-programming::websocket
 [dependencies]
 base64.workspace = true
 futures.workspace = true
-phoenix-channel-runtime = { version = "0.1.0", path = "../phoenix-channel-runtime" }
+phoenix-channel-runtime = { version = "0.1.1", path = "../phoenix-channel-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

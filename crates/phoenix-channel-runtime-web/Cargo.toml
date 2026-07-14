@@ -16,8 +16,8 @@ default-target = "wasm32-unknown-unknown"
 targets = ["wasm32-unknown-unknown"]
 
 [dependencies]
-phoenix-channel-client = { version = "0.1.0", path = "../phoenix-channel-client" }
-phoenix-channel-runtime = { version = "0.1.0", path = "../phoenix-channel-runtime" }
+phoenix-channel-client = { version = "0.1.1", path = "../phoenix-channel-client" }
+phoenix-channel-runtime = { version = "0.1.1", path = "../phoenix-channel-runtime" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 base64.workspace = true
@@ -27,9 +27,9 @@ gloo-timers = { version = "0.3.0", features = ["futures"] }
 serde.workspace = true
 serde_json.workspace = true
 url.workspace = true
-wasm-bindgen = "0.2.126"
-wasm-bindgen-futures = "0.4.76"
-web-sys = { version = "0.3.103", features = ["AbortController", "AbortSignal", "Document", "Event", "EventTarget", "Performance", "VisibilityState", "Window"] }
+wasm-bindgen = "0.2.120"
+wasm-bindgen-futures = "0.4.70"
+web-sys = { version = "0.3.97", features = ["AbortController", "AbortSignal", "Document", "Event", "EventTarget", "Performance", "VisibilityState", "Window"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 serde_json.workspace = true
