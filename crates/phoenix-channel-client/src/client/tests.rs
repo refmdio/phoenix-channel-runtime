@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::VecDeque};
+use std::{cell::RefCell, collections::VecDeque, sync::OnceLock, time::Instant};
 
 use futures::{channel::mpsc, executor::LocalPool, future::LocalBoxFuture, task::LocalSpawnExt};
 use serde_json::json;
@@ -150,6 +150,24 @@ struct ManualTimer {
     requests: mpsc::UnboundedSender<TimerRequest>,
 }
 
+#[derive(Clone, Copy)]
+struct ImmediateZeroTimer;
+
+impl Timer for ImmediateZeroTimer {
+    fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()> {
+        if duration.is_zero() {
+            Box::pin(async {})
+        } else {
+            Box::pin(futures::future::pending())
+        }
+    }
+
+    fn now(&self) -> Duration {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
+    }
+}
+
 impl Timer for ManualTimer {
     fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()> {
         let (fire, receiver) = oneshot::channel();
@@ -159,6 +177,11 @@ impl Timer for ManualTimer {
         Box::pin(async move {
             let _ = receiver.await;
         })
+    }
+
+    fn now(&self) -> Duration {
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        ORIGIN.get_or_init(Instant::now).elapsed()
     }
 }
 
@@ -218,8 +241,42 @@ fn stops_after_a_clean_transport_close() {
         );
         assert_eq!(socket.status(), SocketStatus::Disconnected);
         socket.shutdown().await.unwrap();
+        assert!(matches!(
+            events.next().await,
+            Some(SocketEvent::ReconnectStopped { .. })
+        ));
         assert_eq!(events.next().await, Some(SocketEvent::Closed));
         assert_eq!(socket.status(), SocketStatus::Closed);
+    });
+}
+
+#[test]
+fn reconnect_policy_can_override_close_classification() {
+    let first: Box<dyn Transport> = Box::new(ClosingTransport {
+        close: Some(TransportClose::new(Some(1008), "refresh auth", false)),
+    });
+    let (second, _peer) = connection();
+    let options = Options::default().reconnect_policy(|context| {
+        assert_eq!(context.attempt, 1);
+        assert!(matches!(context.reason, DisconnectReason::Closed(_)));
+        ReconnectAction::RetryAfter(Duration::ZERO)
+    });
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector([first, second]), ImmediateZeroTimer, options);
+    let mut events = socket.events().unwrap();
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let mut retry_scheduled = false;
+        loop {
+            match events.next().await {
+                Some(SocketEvent::ReconnectScheduled { .. }) => retry_scheduled = true,
+                Some(SocketEvent::Connected) if retry_scheduled => break,
+                Some(_) => {}
+                None => panic!("socket event stream ended"),
+            }
+        }
+        socket.shutdown().await.unwrap();
     });
 }
 
@@ -444,11 +501,360 @@ fn buffers_a_call_until_join_and_correlates_its_reply() {
 }
 
 #[test]
+fn pings_the_socket_and_correlates_the_heartbeat_reply() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let server = async {
+            let heartbeat = next_frame(&mut peer).await;
+            assert_eq!(heartbeat.topic, "phoenix");
+            assert_eq!(heartbeat.event, "heartbeat");
+            reply(&peer, &heartbeat, "ok", json!({}));
+        };
+        let client = async {
+            let round_trip = socket.ping().await.unwrap();
+            assert!(round_trip > Duration::ZERO);
+            assert!(round_trip < Duration::from_secs(1));
+            socket.shutdown().await.unwrap();
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
+fn removes_timed_out_pings_from_protocol_state() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let timeout = Duration::from_millis(5);
+        let server = async {
+            let first = next_frame(&mut peer).await;
+            loop {
+                let request = timer_requests.next().await.unwrap();
+                if request.duration == timeout {
+                    request.fire.send(()).unwrap();
+                    break;
+                }
+            }
+            reply(&peer, &first, "ok", json!({}));
+            let second = next_frame(&mut peer).await;
+            reply(&peer, &second, "ok", json!({}));
+        };
+        let client = async {
+            assert_eq!(
+                socket.ping_with_timeout(timeout).await.unwrap_err(),
+                ClientError::Timeout {
+                    operation: ClientOperation::Ping,
+                    timeout,
+                }
+            );
+            socket.ping().await.unwrap();
+            socket.shutdown().await.unwrap();
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
+fn integrates_presence_with_channel_events() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:presence", static_join_payload(json!({})))
+            .unwrap();
+        let mut presence = channel.presence().unwrap();
+        let server = async {
+            let join = next_frame(&mut peer).await;
+            reply(&peer, &join, "ok", json!({}));
+            let state = Frame::new(
+                join.reference.clone(),
+                None,
+                join.topic.clone(),
+                "presence_state",
+                json!({"u1": {"metas": [{"phx_ref": "1", "online_at": 1}]}}),
+            );
+            peer.incoming
+                .as_ref()
+                .unwrap()
+                .unbounded_send(WireMessage::Text(state.encode_text().unwrap()))
+                .unwrap();
+            let leave = next_frame(&mut peer).await;
+            assert_eq!(leave.event, "phx_leave");
+            reply(&peer, &leave, "ok", json!({}));
+        };
+        let client = async {
+            channel.join().await.unwrap();
+            let Some(Ok(PresenceEvent::Joined { key, current, .. })) = presence.next().await else {
+                panic!("expected presence join")
+            };
+            assert_eq!(key, "u1");
+            assert!(current.is_none());
+            assert_eq!(presence.next().await, Some(Ok(PresenceEvent::Synced)));
+            assert!(presence.state().get("u1").is_some());
+            channel.leave().await.unwrap();
+            assert_eq!(presence.next().await, Some(Ok(PresenceEvent::ChannelLeft)));
+            assert!(presence.state().is_empty());
+            socket.shutdown().await.unwrap();
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
+fn resynchronizes_presence_after_subscriber_lag() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let options = Options::default().event_capacity(1);
+    let (socket, driver) = Socket::new(connector, timer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:presence-lag", static_join_payload(json!({})))
+            .unwrap();
+        let mut presence = channel.presence().unwrap();
+        let (burst_sent, burst_received) = oneshot::channel();
+        let (continue_burst, continue_received) = oneshot::channel();
+        let server = async {
+            let join = next_frame(&mut peer).await;
+            reply(&peer, &join, "ok", json!({}));
+            for index in 0..8 {
+                let frame = Frame::new(
+                    join.reference.clone(),
+                    None,
+                    join.topic.clone(),
+                    if index == 0 {
+                        "presence_state"
+                    } else {
+                        "presence_diff"
+                    },
+                    if index == 0 {
+                        json!({"old": {"metas": [{"phx_ref": "old"}]}})
+                    } else {
+                        json!({"joins": {}, "leaves": {}})
+                    },
+                );
+                peer.incoming
+                    .as_ref()
+                    .unwrap()
+                    .unbounded_send(WireMessage::Text(frame.encode_text().unwrap()))
+                    .unwrap();
+            }
+            burst_sent.send(()).unwrap();
+            continue_received.await.unwrap();
+            let trigger = Frame::new(
+                join.reference,
+                None,
+                join.topic,
+                "presence_diff",
+                json!({"joins": {}, "leaves": {}}),
+            );
+            peer.incoming
+                .as_ref()
+                .unwrap()
+                .unbounded_send(WireMessage::Text(trigger.encode_text().unwrap()))
+                .unwrap();
+
+            let leave = next_frame(&mut peer).await;
+            reply(&peer, &leave, "ok", json!({}));
+            let rejoin = next_frame(&mut peer).await;
+            reply(&peer, &rejoin, "ok", json!({}));
+            let state = Frame::new(
+                rejoin.reference,
+                None,
+                rejoin.topic,
+                "presence_state",
+                json!({"new": {"metas": [{"phx_ref": "new"}]}}),
+            );
+            peer.incoming
+                .as_ref()
+                .unwrap()
+                .unbounded_send(WireMessage::Text(state.encode_text().unwrap()))
+                .unwrap();
+        };
+        let client = async {
+            channel.join().await.unwrap();
+            burst_received.await.unwrap();
+            let _ = presence.next().await;
+            let _ = presence.next().await;
+            continue_burst.send(()).unwrap();
+            loop {
+                if matches!(
+                    presence.next().await,
+                    Some(Err(PresenceStreamError::Desynchronized { .. }))
+                ) {
+                    break;
+                }
+            }
+            assert!(presence.requires_resync());
+            assert!(presence.state().is_empty());
+            assert_eq!(
+                presence.next().await,
+                Some(Err(PresenceStreamError::ResyncRequired))
+            );
+            presence.resync().await.unwrap();
+            assert!(!presence.requires_resync());
+            loop {
+                if matches!(
+                    presence.next().await,
+                    Some(Ok(PresenceEvent::Joined { ref key, .. })) if key == "new"
+                ) {
+                    break;
+                }
+            }
+            assert!(presence.state().get("new").is_some());
+            socket.shutdown().await.unwrap();
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
+fn provides_typed_calls_and_error_replies() {
+    let ok = Reply {
+        status: ReplyStatus::Ok,
+        response: json!({"id": 7}).into(),
+    };
+    let value: Value = ok.deserialize_ok().unwrap();
+    assert_eq!(value, json!({"id": 7}));
+
+    let error = Reply {
+        status: ReplyStatus::Error,
+        response: json!({"reason": "denied"}).into(),
+    };
+    assert!(matches!(
+        error.deserialize_ok::<Value>(),
+        Err(ReplyError::Server(_))
+    ));
+}
+
+#[test]
+fn filters_event_subscriptions_and_decodes_typed_calls() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:typed", static_join_payload(json!({})))
+            .unwrap();
+        let mut notices = channel.subscribe("notice").unwrap();
+        let server = async {
+            let join = next_frame(&mut peer).await;
+            reply(&peer, &join, "ok", json!({}));
+            let call = next_frame(&mut peer).await;
+            reply(&peer, &call, "ok", json!({"id": 9}));
+            let notice = Frame::new(
+                join.reference,
+                None,
+                join.topic,
+                "notice",
+                json!({"body": "ready"}),
+            );
+            peer.incoming
+                .as_ref()
+                .unwrap()
+                .unbounded_send(WireMessage::Text(notice.encode_text().unwrap()))
+                .unwrap();
+        };
+        let client = async {
+            channel.join().await.unwrap();
+            let response: Value = channel
+                .call_json("typed", &json!({"request": true}))
+                .await
+                .unwrap();
+            assert_eq!(response, json!({"id": 9}));
+            assert_eq!(
+                notices.next().await,
+                Some(SubscriptionEvent::Message(json!({"body": "ready"}).into()))
+            );
+            socket.shutdown().await.unwrap();
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
+fn survives_repeated_disconnect_and_rejoin_cycles() {
+    const CYCLES: usize = 64;
+    let mut transports = Vec::with_capacity(CYCLES);
+    let mut peers = Vec::with_capacity(CYCLES);
+    for _ in 0..CYCLES {
+        let (transport, peer) = connection();
+        transports.push(transport);
+        peers.push(peer);
+    }
+    let options = Options::default()
+        .reconnect_delay(|_| Duration::ZERO)
+        .rejoin_delay(|_| Duration::ZERO);
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector(transports), ImmediateZeroTimer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let channel = socket
+            .channel("room:soak", static_join_payload(json!({})))
+            .unwrap();
+        let mut statuses = channel.status_changes();
+        let (done_tx, done_rx) = oneshot::channel();
+        let server = async move {
+            for (index, mut peer) in peers.into_iter().enumerate() {
+                let join = next_frame(&mut peer).await;
+                assert_eq!(join.event, "phx_join");
+                reply(&peer, &join, "ok", json!({"generation": index}));
+                if index + 1 < CYCLES {
+                    drop(peer.incoming.take());
+                } else {
+                    let _ = done_tx.send(peer);
+                    return;
+                }
+            }
+        };
+        let client = async {
+            channel.join().await.unwrap();
+            let final_peer = done_rx.await.expect("final peer");
+            while channel.status() != ChannelStatus::Joined {
+                statuses.changed().await.expect("channel status stream");
+            }
+            assert_eq!(channel.status(), ChannelStatus::Joined);
+            socket.shutdown().await.unwrap();
+            drop(final_peer);
+        };
+        futures::join!(server, client);
+    });
+}
+
+#[test]
 fn interrupts_a_transmitted_call_on_disconnect() {
     let (transport, mut peer) = connection();
     let connector = connector([transport]);
     let (timer, _timer_requests) = timer();
-    let options = Options::default();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let options = Options::default().telemetry({
+        let observed = observed.clone();
+        Rc::new(move |event| observed.borrow_mut().push(event.clone()))
+    });
 
     let mut pool = LocalPool::new();
     let (socket, driver) = Socket::new(connector, timer, options);
@@ -477,6 +883,15 @@ fn interrupts_a_transmitted_call_on_disconnect() {
             }
         );
     });
+    assert!(observed.borrow().iter().any(|event| matches!(
+        event,
+        TelemetryEvent::CallCompleted {
+            topic,
+            event,
+            outcome: CallOutcome::Interrupted,
+            ..
+        } if topic == "room:lobby" && event == "save"
+    )));
 }
 
 #[test]

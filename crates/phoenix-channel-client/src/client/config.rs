@@ -4,7 +4,7 @@ use futures::future::LocalBoxFuture;
 use phoenix_channel_runtime::{Transport, TransportError};
 use serde_json::Value;
 
-use super::TelemetryHook;
+use super::{DisconnectReason, TelemetryHook};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectContext {
@@ -22,6 +22,7 @@ pub trait Connector {
 /// Supplies sleeps without choosing an executor.
 pub trait Timer {
     fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()>;
+    fn now(&self) -> Duration;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +30,20 @@ pub struct JoinContext {
     pub attempt: u32,
     pub is_rejoin: bool,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectContext {
+    pub attempt: u32,
+    pub reason: DisconnectReason,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectAction {
+    RetryAfter(Duration),
+    Stop,
+}
+
+pub type ReconnectPolicy = Rc<dyn Fn(ReconnectContext) -> ReconnectAction>;
 
 pub type JoinPayloadLoader =
     Rc<dyn Fn(JoinContext) -> LocalBoxFuture<'static, Result<Value, String>>>;
@@ -49,6 +64,7 @@ pub struct Options {
     pub(crate) call_timeout: Duration,
     pub(crate) leave_timeout: Duration,
     pub(crate) reconnect_delay: Rc<dyn Fn(u32) -> Duration>,
+    pub(crate) reconnect_policy: Option<ReconnectPolicy>,
     pub(crate) rejoin_delay: Rc<dyn Fn(u32) -> Duration>,
     pub(crate) command_capacity: usize,
     pub(crate) push_buffer_capacity: usize,
@@ -67,6 +83,7 @@ impl Default for Options {
             call_timeout: Duration::from_secs(10),
             leave_timeout: Duration::from_secs(10),
             reconnect_delay: Rc::new(default_retry_delay),
+            reconnect_policy: None,
             rejoin_delay: Rc::new(default_retry_delay),
             command_capacity: 64,
             push_buffer_capacity: 64,
@@ -117,6 +134,14 @@ impl Options {
 
     pub fn reconnect_delay(mut self, delay: impl Fn(u32) -> Duration + 'static) -> Self {
         self.reconnect_delay = Rc::new(delay);
+        self
+    }
+
+    pub fn reconnect_policy(
+        mut self,
+        policy: impl Fn(ReconnectContext) -> ReconnectAction + 'static,
+    ) -> Self {
+        self.reconnect_policy = Some(Rc::new(policy));
         self
     }
 

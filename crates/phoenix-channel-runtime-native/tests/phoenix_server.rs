@@ -9,7 +9,8 @@ use std::{
 };
 
 use phoenix_channel_client::{
-    ChannelEvent, ConnectionConfig, Endpoint, Options, Socket, SocketEvent, static_join_payload,
+    ChannelEvent, ConnectionConfig, Endpoint, Options, PresenceEvent, Socket, SocketEvent,
+    static_join_payload,
 };
 use phoenix_channel_runtime::{Payload, ProtocolEvent, ReplyStatus};
 use phoenix_channel_runtime_native::{NativeConnector, NativeSocket, NativeTimer};
@@ -117,6 +118,20 @@ async fn interoperates_with_a_real_phoenix_server() {
                 .expect("call should succeed");
             assert_eq!(reply.status, ReplyStatus::Ok);
             assert_eq!(reply.response, json!({"value": 42}));
+            socket.ping().await.expect("socket ping should succeed");
+
+            let mut presence = channel.presence().expect("presence should subscribe");
+            channel
+                .call("presence", json!({}))
+                .await
+                .expect("presence state should be requested");
+            let presence_event = tokio::time::timeout(Duration::from_secs(5), presence.next())
+                .await
+                .expect("Phoenix presence state timed out");
+            assert!(matches!(
+                presence_event,
+                Some(Ok(PresenceEvent::Joined { ref key, .. })) if key == "native"
+            ));
 
             let reply = channel
                 .call("binary", vec![1, 2, 3, 4])
@@ -161,10 +176,22 @@ async fn interoperates_with_a_real_phoenix_server() {
 
     let socket = NativeSocket::spawn(format!("ws://127.0.0.1:{port}/socket"), connection_config)
         .expect("native worker should start");
+    let mut native_statuses = socket.status_changes();
     socket
         .connect()
         .await
         .expect("native socket should connect");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while socket.status() != phoenix_channel_client::SocketStatus::Connected {
+            native_statuses
+                .changed()
+                .await
+                .expect("native socket status should remain available");
+        }
+    })
+    .await
+    .expect("native socket connection timed out");
+    socket.ping().await.expect("native ping should succeed");
     let channel = socket
         .channel("room:threaded", json!({"name": "threaded"}))
         .await
@@ -184,6 +211,23 @@ async fn interoperates_with_a_real_phoenix_server() {
     .expect("Send channel task should complete")
     .expect("native call should succeed");
     assert_eq!(reply.response, json!({"from": "tokio task"}));
+    let typed_reply: serde_json::Value = channel
+        .call_json("echo", &json!({"typed": true}))
+        .await
+        .expect("native typed call should succeed");
+    assert_eq!(typed_reply, json!({"typed": true}));
+    let mut presence = channel.presence();
+    channel
+        .call("presence", json!({}))
+        .await
+        .expect("native presence state should be requested");
+    let presence_event = tokio::time::timeout(Duration::from_secs(5), presence.next())
+        .await
+        .expect("native presence state timed out");
+    assert!(matches!(
+        presence_event,
+        Ok(PresenceEvent::Joined { ref key, .. }) if key == "threaded"
+    ));
     let reply = channel
         .call("binary", vec![5, 6, 7])
         .await

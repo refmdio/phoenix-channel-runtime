@@ -63,6 +63,10 @@ pub enum TransportEvent {
 /// `LocalBoxFuture` is intentional: browser WebSocket futures are not `Send`.
 /// Native adapters can still be driven on a dedicated local executor.
 pub trait Transport {
+    fn supports_binary(&self) -> bool {
+        true
+    }
+
     fn send<'a>(
         &'a mut self,
         message: WireMessage,

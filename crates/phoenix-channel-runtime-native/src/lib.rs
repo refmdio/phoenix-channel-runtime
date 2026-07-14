@@ -4,7 +4,10 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::{Arc, OnceLock},
+        time::{Duration, Instant},
+    };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use futures::{SinkExt, StreamExt};
@@ -222,6 +225,11 @@ mod native {
     impl Timer for NativeTimer {
         fn sleep(&self, duration: Duration) -> futures::future::LocalBoxFuture<'static, ()> {
             Box::pin(tokio::time::sleep(duration))
+        }
+
+        fn now(&self) -> Duration {
+            static ORIGIN: OnceLock<Instant> = OnceLock::new();
+            ORIGIN.get_or_init(Instant::now).elapsed()
         }
     }
 

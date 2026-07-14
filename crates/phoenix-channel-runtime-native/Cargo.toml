@@ -12,6 +12,7 @@ base64.workspace = true
 phoenix-channel-client = { version = "0.1.0", path = "../phoenix-channel-client" }
 phoenix-channel-runtime = { version = "0.1.0", path = "../phoenix-channel-runtime" }
 serde_json.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 url.workspace = true
 

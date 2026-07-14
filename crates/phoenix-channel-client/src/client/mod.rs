@@ -2,14 +2,21 @@
 
 mod config;
 mod endpoint;
+mod presence;
+#[cfg(feature = "tracing")]
+mod tracing_support;
 
 pub use config::{
-    ConnectContext, Connector, JoinContext, JoinPayloadLoader, Options, Timer, static_join_payload,
+    ConnectContext, Connector, JoinContext, JoinPayloadLoader, Options, ReconnectAction,
+    ReconnectContext, ReconnectPolicy, Timer, static_join_payload,
 };
 pub use endpoint::{
     ConnectionConfig, ConnectionConfigLoader, Endpoint, EndpointError, ResolvedEndpoint,
     static_connection_config,
 };
+pub use presence::{ChannelPresence, PresenceEvent, PresenceStreamError};
+#[cfg(feature = "tracing")]
+pub use tracing_support::tracing_telemetry_hook;
 
 use std::{
     cell::{Cell, RefCell},
@@ -32,6 +39,7 @@ use phoenix_channel_runtime::{
     ProtocolEvent, ReplyStatus, Transport, TransportClose, TransportCloseRequest, TransportError,
     TransportErrorKind, TransportEvent, WireMessage,
 };
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -39,12 +47,25 @@ type RequestId = u64;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum SocketEvent {
-    Connecting { attempt: u32 },
+    Connecting {
+        attempt: u32,
+    },
     Connected,
-    Disconnected { reason: DisconnectReason },
-    ReconnectScheduled { attempt: u32, delay: Duration },
+    Disconnected {
+        reason: DisconnectReason,
+    },
+    ReconnectScheduled {
+        attempt: u32,
+        delay: Duration,
+    },
+    ReconnectStopped {
+        attempt: u32,
+        reason: DisconnectReason,
+    },
     Closed,
-    Lagged { dropped: u64 },
+    Lagged {
+        dropped: u64,
+    },
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -125,6 +146,38 @@ impl Reply {
     pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, PayloadError> {
         self.response.deserialize()
     }
+
+    pub fn into_result(self) -> Result<Payload, Payload> {
+        match self.status {
+            ReplyStatus::Ok => Ok(self.response),
+            ReplyStatus::Error => Err(self.response),
+        }
+    }
+
+    pub fn deserialize_ok<T: DeserializeOwned>(self) -> Result<T, ReplyError> {
+        self.into_result()
+            .map_err(ReplyError::Server)?
+            .deserialize()
+            .map_err(ReplyError::Decode)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ReplyError {
+    #[error("Phoenix returned an error reply: {0:?}")]
+    Server(Payload),
+    #[error("failed to decode reply payload: {0}")]
+    Decode(PayloadError),
+}
+
+#[derive(Debug, Error)]
+pub enum CallJsonError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error("failed to encode request payload: {0}")]
+    Encode(serde_json::Error),
+    #[error(transparent)]
+    Reply(#[from] ReplyError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +186,7 @@ pub enum ClientOperation {
     Call,
     Cast,
     Leave,
+    Ping,
 }
 
 impl std::fmt::Display for ClientOperation {
@@ -142,6 +196,7 @@ impl std::fmt::Display for ClientOperation {
             Self::Call => "call",
             Self::Cast => "cast",
             Self::Leave => "leave",
+            Self::Ping => "ping",
         })
     }
 }
@@ -160,6 +215,10 @@ pub enum ClientError {
     AlreadyJoined(String),
     #[error("channel {0} must be joined again before sending events")]
     ChannelNotJoined(String),
+    #[error("the socket must be connected for this operation")]
+    SocketNotConnected,
+    #[error("the active transport does not support binary Phoenix frames")]
+    BinaryNotSupported,
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         operation: ClientOperation,
@@ -253,6 +312,25 @@ pub enum TelemetryEvent {
         binary: bool,
         bytes: usize,
     },
+    ConnectionAttemptFinished {
+        attempt: u32,
+        duration: Duration,
+        connected: bool,
+    },
+    CallCompleted {
+        topic: String,
+        event: String,
+        outcome: CallOutcome,
+        duration: Duration,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallOutcome {
+    Reply(ReplyStatus),
+    Cancelled,
+    Interrupted,
+    Rejected,
 }
 
 pub type TelemetryHook = Rc<dyn Fn(&TelemetryEvent)>;
@@ -420,6 +498,47 @@ impl Socket {
         self.connect().await
     }
 
+    pub async fn ping(&self) -> Result<Duration, ClientError> {
+        self.ping_with_timeout(self.options.call_timeout).await
+    }
+
+    pub async fn ping_with_timeout(&self, timeout: Duration) -> Result<Duration, ClientError> {
+        let id = self.next_request_id();
+        let (response, receiver) = oneshot::channel();
+        let mut commands = self.commands.clone();
+        commands
+            .send(Command::Ping { id, response })
+            .await
+            .map_err(|_| ClientError::DriverStopped)?;
+        let mut guard = RequestGuard {
+            id,
+            lifecycle: self.lifecycle.clone(),
+            armed: true,
+        };
+        let response = receiver.fuse();
+        let timeout_future = self.timer.sleep(timeout).fuse();
+        futures::pin_mut!(response, timeout_future);
+        futures::select! {
+            response = response => {
+                guard.armed = false;
+                response.map_err(|_| ClientError::DriverStopped)?
+            },
+            () = timeout_future => Err(ClientError::Timeout {
+                operation: ClientOperation::Ping,
+                timeout,
+            }),
+        }
+    }
+
+    fn next_request_id(&self) -> RequestId {
+        let mut id = self.request_ids.get().wrapping_add(1);
+        if id == 0 {
+            id = 1;
+        }
+        self.request_ids.set(id);
+        id
+    }
+
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let (response, receiver) = oneshot::channel();
         let mut commands = self.commands.clone();
@@ -514,11 +633,28 @@ impl Channel {
             topic: self.topic.clone(),
             event: event.into(),
             payload: payload.into(),
+            started: self.timer.now(),
             response,
         })
         .await?;
         self.wait(id, ClientOperation::Call, timeout, receiver)
             .await
+    }
+
+    pub async fn call_json<Request, Response>(
+        &self,
+        event: impl Into<String>,
+        request: &Request,
+    ) -> Result<Response, CallJsonError>
+    where
+        Request: Serialize + ?Sized,
+        Response: DeserializeOwned,
+    {
+        let payload = serde_json::to_value(request).map_err(CallJsonError::Encode)?;
+        self.call(event, payload)
+            .await?
+            .deserialize_ok()
+            .map_err(Into::into)
     }
 
     /// Sends an event without asking Phoenix for a reply.
@@ -585,6 +721,17 @@ impl Channel {
         Ok(ChannelEvents { receiver })
     }
 
+    pub fn subscribe(&self, event: impl Into<String>) -> Result<EventSubscription, ClientError> {
+        Ok(EventSubscription {
+            event: event.into(),
+            events: self.events()?,
+        })
+    }
+
+    pub fn presence(&self) -> Result<ChannelPresence<'_>, ClientError> {
+        ChannelPresence::new(self)
+    }
+
     async fn send(&self, command: Command) -> Result<(), ClientError> {
         let mut commands = self.commands.clone();
         commands
@@ -632,6 +779,49 @@ impl Channel {
 
 pub struct ChannelEvents {
     receiver: mpsc::Receiver<ChannelEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SubscriptionEvent {
+    Message(Payload),
+    Disconnected,
+    ChannelError(Payload),
+    ChannelClosed(Payload),
+    Lagged { dropped: u64 },
+}
+
+pub struct EventSubscription {
+    event: String,
+    events: ChannelEvents,
+}
+
+impl EventSubscription {
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
+    pub async fn next(&mut self) -> Option<SubscriptionEvent> {
+        loop {
+            match self.events.next().await? {
+                ChannelEvent::Protocol(ProtocolEvent::Message(frame))
+                    if frame.event == self.event =>
+                {
+                    return Some(SubscriptionEvent::Message(frame.payload));
+                }
+                ChannelEvent::Protocol(ProtocolEvent::ChannelError { payload, .. }) => {
+                    return Some(SubscriptionEvent::ChannelError(payload));
+                }
+                ChannelEvent::Protocol(ProtocolEvent::ChannelClosed { payload, .. }) => {
+                    return Some(SubscriptionEvent::ChannelClosed(payload));
+                }
+                ChannelEvent::Disconnected => return Some(SubscriptionEvent::Disconnected),
+                ChannelEvent::Lagged { dropped } => {
+                    return Some(SubscriptionEvent::Lagged { dropped });
+                }
+                ChannelEvent::Protocol(_) | ChannelEvent::JoinPayloadError(_) => {}
+            }
+        }
+    }
 }
 
 impl ChannelEvents {
@@ -720,6 +910,10 @@ enum Command {
         topic: String,
         events: mpsc::Sender<ChannelEvent>,
     },
+    Ping {
+        id: RequestId,
+        response: oneshot::Sender<Result<Duration, ClientError>>,
+    },
     Join {
         id: RequestId,
         topic: String,
@@ -731,6 +925,7 @@ enum Command {
         topic: String,
         event: String,
         payload: Payload,
+        started: Duration,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
@@ -756,6 +951,7 @@ enum QueuedPush {
         id: RequestId,
         event: String,
         payload: Payload,
+        started: Duration,
         response: oneshot::Sender<Result<Reply, ClientError>>,
     },
     Cast {
@@ -815,7 +1011,16 @@ struct EventSubscriber<T> {
 
 struct PendingCall {
     id: RequestId,
+    topic: String,
+    event: String,
+    started: Duration,
     response: oneshot::Sender<Result<Reply, ClientError>>,
+}
+
+struct PendingPing {
+    id: RequestId,
+    started: Duration,
+    response: oneshot::Sender<Result<Duration, ClientError>>,
 }
 
 struct PendingLeave {
@@ -851,6 +1056,7 @@ struct DriverState {
     socket_subscribers: Vec<EventSubscriber<SocketEvent>>,
     pending_joins: HashMap<String, String>,
     pending_calls: HashMap<String, PendingCall>,
+    pending_pings: HashMap<String, PendingPing>,
     pending_leaves: HashMap<String, PendingLeave>,
     next_payload_id: u64,
     socket_status: Rc<ObservableStatus<SocketStatus>>,
@@ -878,6 +1084,7 @@ impl DriverState {
             socket_subscribers: Vec::new(),
             pending_joins: HashMap::new(),
             pending_calls: HashMap::new(),
+            pending_pings: HashMap::new(),
             pending_leaves: HashMap::new(),
             next_payload_id: 0,
             socket_status,
@@ -904,6 +1111,7 @@ impl DriverState {
             }
 
             self.emit_socket(SocketEvent::Connecting { attempt });
+            let connection_started = self.timer.now();
             let connection = self.connector.connect(ConnectContext { attempt }).fuse();
             let connect_timeout = self.timer.sleep(self.options.connect_timeout).fuse();
             futures::pin_mut!(connection, connect_timeout);
@@ -942,8 +1150,13 @@ impl DriverState {
                 self.emit_socket(SocketEvent::Closed);
                 return;
             };
+            self.telemetry(TelemetryEvent::ConnectionAttemptFinished {
+                attempt,
+                duration: self.timer.now().saturating_sub(connection_started),
+                connected: matches!(&connected, ConnectAttemptExit::Connected(Ok(_))),
+            });
 
-            match connected {
+            let retry_reason = match connected {
                 ConnectAttemptExit::Connected(Ok(mut transport)) => {
                     attempt = 0;
                     self.emit_socket(SocketEvent::Connected);
@@ -968,17 +1181,16 @@ impl DriverState {
                         ConnectedExit::Disconnected(reason) => {
                             let _ = transport.close().await;
                             self.on_disconnect(&reason);
-                            if !reason.should_reconnect() {
-                                connection_enabled = false;
-                                continue;
-                            }
+                            reason
                         }
                     }
                 }
                 ConnectAttemptExit::Connected(Err(error)) => {
+                    let reason = DisconnectReason::Connect(error);
                     self.emit_socket(SocketEvent::Disconnected {
-                        reason: DisconnectReason::Connect(error),
+                        reason: reason.clone(),
                     });
+                    reason
                 }
                 ConnectAttemptExit::Disconnect(response) => {
                     self.on_disconnect(&DisconnectReason::Requested);
@@ -991,10 +1203,32 @@ impl DriverState {
                     self.emit_socket(SocketEvent::Closed);
                     return;
                 }
-            }
+            };
 
             attempt = attempt.saturating_add(1);
-            let delay = (self.options.reconnect_delay)(attempt);
+            let action = self.options.reconnect_policy.as_ref().map_or_else(
+                || {
+                    if retry_reason.should_reconnect() {
+                        ReconnectAction::RetryAfter((self.options.reconnect_delay)(attempt))
+                    } else {
+                        ReconnectAction::Stop
+                    }
+                },
+                |policy| {
+                    policy(ReconnectContext {
+                        attempt,
+                        reason: retry_reason.clone(),
+                    })
+                },
+            );
+            let ReconnectAction::RetryAfter(delay) = action else {
+                self.emit_socket(SocketEvent::ReconnectStopped {
+                    attempt,
+                    reason: retry_reason,
+                });
+                connection_enabled = false;
+                continue;
+            };
             self.emit_socket(SocketEvent::ReconnectScheduled { attempt, delay });
             match self.wait_offline(delay).await {
                 OfflineExit::Retry => {}
@@ -1268,6 +1502,9 @@ impl DriverState {
                 dropped: 0,
             }),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
+            Command::Ping { response, .. } => {
+                let _ = response.send(Err(ClientError::SocketNotConnected));
+            }
             Command::Join {
                 id,
                 topic,
@@ -1288,6 +1525,7 @@ impl DriverState {
                 topic,
                 event,
                 payload,
+                started,
                 response,
             } => self.queue(
                 &topic,
@@ -1295,6 +1533,7 @@ impl DriverState {
                     id,
                     event,
                     payload,
+                    started,
                     response,
                 },
             ),
@@ -1374,6 +1613,18 @@ impl DriverState {
                 dropped: 0,
             }),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
+            Command::Ping { id, response } => {
+                let outbound = self.protocol.heartbeat();
+                self.pending_pings.insert(
+                    outbound.reference.clone(),
+                    PendingPing {
+                        id,
+                        started: self.timer.now(),
+                        response,
+                    },
+                );
+                self.send_frame(transport, outbound.frame).await?;
+            }
             Command::Join {
                 id,
                 topic,
@@ -1401,12 +1652,14 @@ impl DriverState {
                 topic,
                 event,
                 payload,
+                started,
                 response,
             } => {
                 let push = QueuedPush::Call {
                     id,
                     event,
                     payload,
+                    started,
                     response,
                 };
                 if self.protocol.channel_state(&topic) == Some(ChannelState::Joined) {
@@ -1746,9 +1999,15 @@ impl DriverState {
                 status,
                 response,
                 topic,
-                ..
+                event: _,
             } => {
                 if let Some(pending) = self.pending_calls.remove(reference) {
+                    self.telemetry(TelemetryEvent::CallCompleted {
+                        topic: pending.topic.clone(),
+                        event: pending.event.clone(),
+                        outcome: CallOutcome::Reply(*status),
+                        duration: self.timer.now().saturating_sub(pending.started),
+                    });
                     let _ = pending.response.send(Ok(Reply {
                         status: *status,
                         response: response.clone(),
@@ -1785,6 +2044,9 @@ impl DriverState {
             ProtocolEvent::HeartbeatAck { reference, .. } => {
                 if heartbeat_reference.as_deref() == Some(reference) {
                     *heartbeat_reference = None;
+                } else if let Some(ping) = self.pending_pings.remove(reference) {
+                    let elapsed = self.timer.now().saturating_sub(ping.started);
+                    let _ = ping.response.send(Ok(elapsed));
                 }
             }
             ProtocolEvent::ChannelError { topic, .. } => {
@@ -1967,14 +2229,33 @@ impl DriverState {
                 id,
                 event,
                 payload,
+                started,
                 response,
             } => {
+                if matches!(&payload, Payload::Binary(_)) && !transport.supports_binary() {
+                    self.emit_call_completed(
+                        topic.to_owned(),
+                        event,
+                        started,
+                        CallOutcome::Rejected,
+                    );
+                    let _ = response.send(Err(ClientError::BinaryNotSupported));
+                    return Ok(());
+                }
                 let outbound = self
                     .protocol
                     .push(topic, event, payload)
                     .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
-                self.pending_calls
-                    .insert(outbound.reference.clone(), PendingCall { id, response });
+                self.pending_calls.insert(
+                    outbound.reference.clone(),
+                    PendingCall {
+                        id,
+                        topic: topic.to_owned(),
+                        event: outbound.frame.event.clone(),
+                        started,
+                        response,
+                    },
+                );
                 self.send_frame(transport, outbound.frame).await
             }
             QueuedPush::Cast {
@@ -1983,6 +2264,10 @@ impl DriverState {
                 response,
                 ..
             } => {
+                if matches!(&payload, Payload::Binary(_)) && !transport.supports_binary() {
+                    let _ = response.send(Err(ClientError::BinaryNotSupported));
+                    return Ok(());
+                }
                 let frame = self
                     .protocol
                     .cast(topic, event, payload)
@@ -2049,7 +2334,9 @@ impl DriverState {
             }
             return;
         }
-        for channel in self.channels.values_mut() {
+        let mut removed_queued = false;
+        let mut cancelled_call = None;
+        for (topic, channel) in &mut self.channels {
             if let Some(pending) = channel
                 .deferred_leave
                 .as_mut()
@@ -2059,17 +2346,42 @@ impl DriverState {
                 return;
             }
             if let Some(index) = channel.queued.iter().position(|push| push.id() == id) {
-                channel.queued.remove(index);
-                return;
+                if let Some(QueuedPush::Call { event, started, .. }) = channel.queued.remove(index)
+                {
+                    cancelled_call = Some((topic.clone(), event, started));
+                }
+                removed_queued = true;
+                break;
             }
+        }
+        if let Some((topic, event, started)) = cancelled_call {
+            self.emit_call_completed(topic, event, started, CallOutcome::Cancelled);
+        }
+        if removed_queued {
+            return;
         }
         let reference = self
             .pending_calls
             .iter()
             .find_map(|(reference, pending)| (pending.id == id).then(|| reference.clone()));
         if let Some(reference) = reference {
-            self.pending_calls.remove(&reference);
+            if let Some(pending) = self.pending_calls.remove(&reference) {
+                self.emit_call_completed(
+                    pending.topic,
+                    pending.event,
+                    pending.started,
+                    CallOutcome::Cancelled,
+                );
+            }
             self.protocol.forget_push(&reference);
+        }
+        let reference = self
+            .pending_pings
+            .iter()
+            .find_map(|(reference, pending)| (pending.id == id).then(|| reference.clone()));
+        if let Some(reference) = reference {
+            self.pending_pings.remove(&reference);
+            self.protocol.forget_heartbeat(&reference);
         }
         let reference = self
             .pending_leaves
@@ -2083,6 +2395,7 @@ impl DriverState {
     }
 
     fn stop_channel(&mut self, topic: &str) {
+        let mut interrupted_calls = Vec::new();
         if let Some(channel) = self.channels.get_mut(topic) {
             channel.desired = false;
             channel.active_payload = None;
@@ -2100,17 +2413,49 @@ impl DriverState {
                 }));
             }
             for push in channel.queued.drain(..) {
-                push.interrupt();
+                match push {
+                    QueuedPush::Call {
+                        event,
+                        started,
+                        response,
+                        ..
+                    } => {
+                        interrupted_calls.push((event, started));
+                        let _ = response.send(Err(ClientError::Interrupted {
+                            operation: ClientOperation::Call,
+                        }));
+                    }
+                    push @ QueuedPush::Cast { .. } => push.interrupt(),
+                }
             }
+        }
+        for (event, started) in interrupted_calls {
+            self.emit_call_completed(topic.to_owned(), event, started, CallOutcome::Interrupted);
         }
     }
 
     fn on_disconnect(&mut self, reason: &DisconnectReason) {
         let events = self.protocol.reset_connection();
         self.pending_joins.clear();
-        for (_, pending) in self.pending_calls.drain() {
+        let interrupted_calls = self
+            .pending_calls
+            .drain()
+            .map(|(_, pending)| pending)
+            .collect::<Vec<_>>();
+        for pending in interrupted_calls {
+            self.emit_call_completed(
+                pending.topic,
+                pending.event,
+                pending.started,
+                CallOutcome::Interrupted,
+            );
             let _ = pending.response.send(Err(ClientError::Interrupted {
                 operation: ClientOperation::Call,
+            }));
+        }
+        for (_, pending) in self.pending_pings.drain() {
+            let _ = pending.response.send(Err(ClientError::Interrupted {
+                operation: ClientOperation::Ping,
             }));
         }
         for (_, pending) in self.pending_leaves.drain() {
@@ -2159,6 +2504,7 @@ impl DriverState {
             SocketEvent::Disconnected { reason } if !reason.should_reconnect() => {
                 SocketStatus::Disconnected
             }
+            SocketEvent::ReconnectStopped { .. } => SocketStatus::Disconnected,
             SocketEvent::Disconnected { .. } | SocketEvent::ReconnectScheduled { .. } => {
                 SocketStatus::WaitingToReconnect
             }
@@ -2191,6 +2537,21 @@ impl DriverState {
         if let Some(hook) = &self.options.telemetry {
             hook(&event);
         }
+    }
+
+    fn emit_call_completed(
+        &self,
+        topic: String,
+        event: String,
+        started: Duration,
+        outcome: CallOutcome,
+    ) {
+        self.telemetry(TelemetryEvent::CallCompleted {
+            topic,
+            event,
+            outcome,
+            duration: self.timer.now().saturating_sub(started),
+        });
     }
 }
 

@@ -15,3 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
+tracing = { version = "0.1.44", optional = true }
+
+[features]
+default = []
+tracing = ["dep:tracing"]

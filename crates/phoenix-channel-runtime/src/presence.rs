@@ -136,6 +136,7 @@ impl PresenceTracker {
     }
 
     pub fn reset(&mut self) {
+        self.state = PresenceState::default();
         self.join_ref = None;
         self.pending_diffs.clear();
     }
@@ -342,5 +343,31 @@ mod tests {
         assert_eq!(diff.joins.get("u1").unwrap().metas.len(), 1);
         assert_eq!(diff.leaves.get("u1").unwrap().metas.len(), 1);
         assert_eq!(current.get("u1").unwrap().metas.len(), 2);
+    }
+
+    #[test]
+    fn reset_discards_state_and_pending_diffs() {
+        let mut tracker = PresenceTracker::new();
+        tracker
+            .apply(&frame(
+                "1",
+                "presence_state",
+                json!({"u1": {"metas": [{"phx_ref": "a"}]}}),
+            ))
+            .unwrap();
+        assert!(!tracker.state().is_empty());
+
+        tracker.reset();
+        assert!(tracker.state().is_empty());
+        assert_eq!(
+            tracker
+                .apply(&frame(
+                    "2",
+                    "presence_diff",
+                    json!({"joins": {}, "leaves": {}}),
+                ))
+                .unwrap(),
+            PresenceUpdate::Pending
+        );
     }
 }

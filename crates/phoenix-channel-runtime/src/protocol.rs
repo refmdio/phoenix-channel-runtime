@@ -286,6 +286,17 @@ impl Protocol {
         }
     }
 
+    /// Stops correlating a heartbeat reply, for example after an explicit ping
+    /// has timed out at the client API boundary.
+    pub fn forget_heartbeat(&mut self, reference: &str) -> bool {
+        if matches!(self.pending.get(reference), Some(Pending::Heartbeat)) {
+            self.pending.remove(reference);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Removes all local state associated with a topic.
     ///
     /// This is used when a channel handle is dropped. Any later replies for
@@ -597,6 +608,20 @@ mod tests {
                 status: ReplyStatus::Ok,
                 response: json!({"id": 99}).into(),
             }
+        );
+    }
+
+    #[test]
+    fn forgets_a_timed_out_heartbeat() {
+        let mut protocol = Protocol::new();
+        let heartbeat = protocol.heartbeat();
+        assert!(protocol.forget_heartbeat(&heartbeat.reference));
+        assert!(!protocol.forget_heartbeat(&heartbeat.reference));
+        assert_eq!(
+            protocol
+                .receive(reply(&heartbeat, "ok", json!({})))
+                .unwrap(),
+            ProtocolEvent::UnmatchedReply(reply(&heartbeat, "ok", json!({})))
         );
     }
 

@@ -20,4 +20,12 @@ defmodule PhoenixChannelFixture.RoomChannel do
     broadcast!(socket, "broadcast", Map.put(payload, "sender", socket.assigns.name))
     {:reply, {:ok, %{"sent" => true}}, socket}
   end
+
+  def handle_in("presence", _payload, socket) do
+    push(socket, "presence_state", %{
+      socket.assigns.name => %{metas: [%{phx_ref: "fixture-1", online_at: 1}]}
+    })
+
+    {:reply, {:ok, %{"sent" => true}}, socket}
+  end
 end

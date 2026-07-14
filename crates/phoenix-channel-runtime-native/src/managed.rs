@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     rc::Rc,
@@ -15,9 +15,13 @@ use std::{
 use futures::{FutureExt, future::BoxFuture};
 use phoenix_channel_client::{
     Channel, ChannelEvent, ChannelStatus, ClientError, ConnectContext, ConnectionConfig, Endpoint,
-    EndpointError, JoinContext, Options, Reply, Socket, SocketEvent, SocketStatus, TelemetryEvent,
+    EndpointError, JoinContext, Options, PresenceEvent, ReconnectAction, ReconnectContext, Reply,
+    Socket, SocketEvent, SocketStatus, SubscriptionEvent, TelemetryEvent,
 };
-use phoenix_channel_runtime::Payload;
+use phoenix_channel_runtime::{
+    Payload, PresenceError, PresenceState, PresenceTracker, PresenceUpdate, ProtocolEvent,
+};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -32,6 +36,7 @@ pub type NativeJoinPayloadLoader =
     Arc<dyn Fn(JoinContext) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
 pub type NativeTelemetryHook = Arc<dyn Fn(&TelemetryEvent) + Send + Sync>;
+pub type NativeReconnectPolicy = Arc<dyn Fn(ReconnectContext) -> ReconnectAction + Send + Sync>;
 
 pub fn native_static_connection_config(config: ConnectionConfig) -> NativeConnectionConfigLoader {
     Arc::new(move |_| {
@@ -62,6 +67,7 @@ pub struct NativeOptions {
     event_capacity: usize,
     transport: NativeTransportOptions,
     telemetry: Option<NativeTelemetryHook>,
+    reconnect_policy: Option<NativeReconnectPolicy>,
 }
 
 impl Default for NativeOptions {
@@ -87,6 +93,7 @@ impl Default for NativeOptions {
             event_capacity: 256,
             transport: NativeTransportOptions::default(),
             telemetry: None,
+            reconnect_policy: None,
         }
     }
 }
@@ -159,6 +166,11 @@ impl NativeOptions {
         self
     }
 
+    pub fn reconnect_policy(mut self, policy: NativeReconnectPolicy) -> Self {
+        self.reconnect_policy = Some(policy);
+        self
+    }
+
     pub fn transport(mut self, options: NativeTransportOptions) -> Self {
         self.transport = options;
         self
@@ -183,6 +195,10 @@ impl NativeOptions {
         if let Some(hook) = &self.telemetry {
             let hook = hook.clone();
             options = options.telemetry(Rc::new(move |event| hook(event)));
+        }
+        if let Some(policy) = &self.reconnect_policy {
+            let policy = policy.clone();
+            options = options.reconnect_policy(move |context| policy(context));
         }
         options
     }
@@ -219,6 +235,16 @@ pub enum NativeRuntimeError {
     WorkerFailed(String),
     #[error("failed to join native client worker: {0}")]
     WorkerJoin(String),
+}
+
+#[derive(Debug, Error)]
+pub enum NativeCallJsonError {
+    #[error(transparent)]
+    Runtime(#[from] NativeRuntimeError),
+    #[error("failed to encode request payload: {0}")]
+    Encode(serde_json::Error),
+    #[error(transparent)]
+    Reply(#[from] phoenix_channel_client::ReplyError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,6 +447,27 @@ impl NativeSocket {
         .await
     }
 
+    pub async fn ping(&self) -> Result<Duration, NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Ping {
+            request_id,
+            timeout: None,
+            response,
+        })
+        .await
+    }
+
+    pub async fn ping_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<Duration, NativeRuntimeError> {
+        self.request(|request_id, response| HostCommand::Ping {
+            request_id,
+            timeout: Some(timeout),
+            response,
+        })
+        .await
+    }
+
     pub async fn disconnect(&self) -> Result<(), NativeRuntimeError> {
         self.unit_request(|request_id, response| HostCommand::Disconnect {
             request_id,
@@ -478,9 +525,13 @@ impl NativeSocket {
     }
 
     pub async fn shutdown(&self) -> Result<(), NativeRuntimeError> {
-        self.unit_command(|response| HostCommand::Shutdown { response })
-            .await?;
-        self.owner.join()
+        let command_result = self
+            .unit_command(|response| HostCommand::Shutdown { response })
+            .await;
+        match self.owner.join() {
+            Err(error) => Err(error),
+            Ok(()) => command_result,
+        }
     }
 
     pub fn join_worker(&self) -> Result<(), NativeRuntimeError> {
@@ -607,6 +658,23 @@ impl NativeChannel {
         }
     }
 
+    pub fn presence(&self) -> NativeChannelPresence {
+        NativeChannelPresence {
+            channel: self.clone(),
+            events: self.events(),
+            tracker: PresenceTracker::new(),
+            pending: VecDeque::new(),
+            desynchronized: false,
+        }
+    }
+
+    pub fn subscribe(&self, event: impl Into<String>) -> NativeEventSubscription {
+        NativeEventSubscription {
+            event: event.into(),
+            events: self.events(),
+        }
+    }
+
     pub async fn join(&self) -> Result<Payload, NativeRuntimeError> {
         self.request(|request_id, response| HostCommand::Join {
             request_id,
@@ -661,6 +729,22 @@ impl NativeChannel {
             response,
         })
         .await
+    }
+
+    pub async fn call_json<Request, Response>(
+        &self,
+        event: impl Into<String>,
+        request: &Request,
+    ) -> Result<Response, NativeCallJsonError>
+    where
+        Request: Serialize + ?Sized,
+        Response: DeserializeOwned,
+    {
+        let payload = serde_json::to_value(request).map_err(NativeCallJsonError::Encode)?;
+        self.call(event, payload)
+            .await?
+            .deserialize_ok()
+            .map_err(Into::into)
     }
 
     pub async fn cast(
@@ -793,6 +877,142 @@ pub struct NativeChannelEvents {
     receiver: broadcast::Receiver<ChannelEvent>,
 }
 
+pub struct NativeChannelPresence {
+    channel: NativeChannel,
+    events: NativeChannelEvents,
+    tracker: PresenceTracker,
+    pending: VecDeque<PresenceEvent>,
+    desynchronized: bool,
+}
+
+pub struct NativeEventSubscription {
+    event: String,
+    events: NativeChannelEvents,
+}
+
+impl NativeEventSubscription {
+    pub fn event(&self) -> &str {
+        &self.event
+    }
+
+    pub async fn next(&mut self) -> Result<SubscriptionEvent, NativeEventError> {
+        loop {
+            match self.events.next().await? {
+                ChannelEvent::Protocol(ProtocolEvent::Message(frame))
+                    if frame.event == self.event =>
+                {
+                    return Ok(SubscriptionEvent::Message(frame.payload));
+                }
+                ChannelEvent::Protocol(ProtocolEvent::ChannelError { payload, .. }) => {
+                    return Ok(SubscriptionEvent::ChannelError(payload));
+                }
+                ChannelEvent::Protocol(ProtocolEvent::ChannelClosed { payload, .. }) => {
+                    return Ok(SubscriptionEvent::ChannelClosed(payload));
+                }
+                ChannelEvent::Disconnected => return Ok(SubscriptionEvent::Disconnected),
+                ChannelEvent::Lagged { dropped } => {
+                    return Ok(SubscriptionEvent::Lagged { dropped });
+                }
+                ChannelEvent::Protocol(_) | ChannelEvent::JoinPayloadError(_) => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NativePresenceError {
+    #[error(transparent)]
+    Events(#[from] NativeEventError),
+    #[error(transparent)]
+    Decode(#[from] PresenceError),
+    #[error("presence event stream dropped {dropped} events and must be resynchronized")]
+    Desynchronized { dropped: u64 },
+    #[error("presence state must be resynchronized before consuming more events")]
+    ResyncRequired,
+}
+
+impl NativeChannelPresence {
+    pub fn state(&self) -> &PresenceState {
+        self.tracker.state()
+    }
+
+    pub fn requires_resync(&self) -> bool {
+        self.desynchronized
+    }
+
+    pub async fn resync(&mut self) -> Result<(), NativeRuntimeError> {
+        self.tracker.reset();
+        self.pending.clear();
+        self.channel.leave().await?;
+        self.events = self.channel.events();
+        self.channel.join().await?;
+        self.desynchronized = false;
+        Ok(())
+    }
+
+    pub async fn next(&mut self) -> Result<PresenceEvent, NativePresenceError> {
+        if self.desynchronized {
+            return Err(NativePresenceError::ResyncRequired);
+        }
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(event);
+            }
+            match self.events.next().await {
+                Ok(ChannelEvent::Protocol(ProtocolEvent::Message(frame))) => {
+                    let previous = self.tracker.state().clone();
+                    match self.tracker.apply(&frame)? {
+                        PresenceUpdate::Synced(diff) => {
+                            for (key, joined) in diff.joins.0 {
+                                self.pending.push_back(PresenceEvent::Joined {
+                                    current: previous.get(&key).cloned(),
+                                    key,
+                                    joined,
+                                });
+                            }
+                            for (key, left) in diff.leaves.0 {
+                                if let Some(current) = previous.get(&key).cloned() {
+                                    self.pending.push_back(PresenceEvent::Left {
+                                        key,
+                                        current,
+                                        left,
+                                    });
+                                }
+                            }
+                            self.pending.push_back(PresenceEvent::Synced);
+                        }
+                        PresenceUpdate::Ignored | PresenceUpdate::Pending => {}
+                    }
+                }
+                Ok(ChannelEvent::Disconnected) => {
+                    self.tracker.reset();
+                    return Ok(PresenceEvent::Disconnected);
+                }
+                Ok(ChannelEvent::Lagged { dropped }) | Err(NativeEventError::Lagged(dropped)) => {
+                    self.tracker.reset();
+                    self.pending.clear();
+                    self.desynchronized = true;
+                    return Err(NativePresenceError::Desynchronized { dropped });
+                }
+                Ok(ChannelEvent::Protocol(ProtocolEvent::Left { .. })) => {
+                    self.tracker.reset();
+                    return Ok(PresenceEvent::ChannelLeft);
+                }
+                Ok(ChannelEvent::Protocol(ProtocolEvent::ChannelClosed { .. })) => {
+                    self.tracker.reset();
+                    return Ok(PresenceEvent::ChannelClosed);
+                }
+                Ok(ChannelEvent::Protocol(ProtocolEvent::ChannelError { .. })) => {
+                    self.tracker.reset();
+                    return Ok(PresenceEvent::ChannelError);
+                }
+                Ok(ChannelEvent::Protocol(_) | ChannelEvent::JoinPayloadError(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
 impl NativeChannelEvents {
     pub async fn next(&mut self) -> Result<ChannelEvent, NativeEventError> {
         receive_event(&mut self.receiver).await
@@ -847,6 +1067,11 @@ enum HostCommand {
         code: u16,
         reason: String,
         response: oneshot::Sender<Result<(), ClientError>>,
+    },
+    Ping {
+        request_id: u64,
+        timeout: Option<Duration>,
+        response: oneshot::Sender<Result<Duration, ClientError>>,
     },
     Shutdown {
         response: oneshot::Sender<Result<(), ClientError>>,
@@ -1093,6 +1318,24 @@ async fn handle_host_command(
                 let _ = response.send(socket.disconnect_with(code, reason).await);
             });
         }
+        HostCommand::Ping {
+            request_id,
+            timeout,
+            response,
+        } => {
+            known_requests.remove(&request_id);
+            if cancelled.remove(&request_id) {
+                return false;
+            }
+            let socket = socket.clone();
+            track_operation(request_id, control, operations, async move {
+                let result = match timeout {
+                    Some(timeout) => socket.ping_with_timeout(timeout).await,
+                    None => socket.ping().await,
+                };
+                let _ = response.send(result);
+            });
+        }
         HostCommand::Shutdown { response } => {
             let result = socket.shutdown().await;
             let _ = response.send(result);
@@ -1284,6 +1527,10 @@ fn panic_message(panic: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use futures::StreamExt;
+
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1292,6 +1539,8 @@ mod tests {
     fn native_handles_are_send_and_sync() {
         assert_send_sync::<NativeSocket>();
         assert_send_sync::<NativeChannel>();
+        assert_send_sync::<NativeChannelPresence>();
+        assert_send_sync::<NativeEventSubscription>();
         assert_send_sync::<NativeOptions>();
     }
 
@@ -1300,6 +1549,88 @@ mod tests {
         let delays = [Duration::from_secs(1), Duration::from_secs(3)];
         assert_eq!(retry_delay(&delays, 0), Duration::from_secs(1));
         assert_eq!(retry_delay(&delays, 8), Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_subscriptions_report_broadcast_lag() {
+        let (events, receiver) = broadcast::channel(1);
+        let mut subscription = NativeEventSubscription {
+            event: "notice".into(),
+            events: NativeChannelEvents { receiver },
+        };
+        events.send(ChannelEvent::Disconnected).unwrap();
+        events.send(ChannelEvent::Disconnected).unwrap();
+        assert!(matches!(
+            subscription.next().await,
+            Err(NativeEventError::Lagged(1))
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconnect_policy_runs_on_the_native_worker() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let options = NativeOptions::default().reconnect_policy({
+            let attempts = attempts.clone();
+            Arc::new(move |_| {
+                attempts.fetch_add(1, AtomicOrdering::SeqCst);
+                ReconnectAction::Stop
+            })
+        });
+        let socket = NativeSocket::spawn_with_options(
+            format!("ws://127.0.0.1:{port}/socket"),
+            ConnectionConfig::default(),
+            options,
+        )
+        .unwrap();
+        socket.connect().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native reconnect policy was not invoked");
+        socket.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_ping_timeout_cancels_the_host_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while websocket.next().await.is_some() {}
+        });
+        let socket = NativeSocket::spawn(
+            format!("ws://127.0.0.1:{port}/socket"),
+            ConnectionConfig::default(),
+        )
+        .unwrap();
+        socket.connect().await.unwrap();
+        let mut statuses = socket.status_changes();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while socket.status() != SocketStatus::Connected {
+                statuses.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("native test socket did not connect");
+
+        assert!(matches!(
+            socket.ping_with_timeout(Duration::from_millis(20)).await,
+            Err(NativeRuntimeError::Client(ClientError::Timeout {
+                operation: phoenix_channel_client::ClientOperation::Ping,
+                ..
+            }))
+        ));
+        socket.shutdown().await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
