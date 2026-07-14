@@ -117,12 +117,12 @@ impl Protocol {
         params: Value,
     ) -> Result<Outbound, ProtocolError> {
         let topic = topic.into();
-        if let Some(channel) = self.channels.get(&topic)
-            && matches!(
+        if self.channels.get(&topic).is_some_and(|channel| {
+            matches!(
                 channel.state,
                 ChannelState::Joining | ChannelState::Joined | ChannelState::Leaving
             )
-        {
+        }) {
             return Err(ProtocolError::AlreadyActive(topic));
         }
 
@@ -324,10 +324,9 @@ impl Protocol {
     }
 
     pub fn receive(&mut self, frame: Frame) -> Result<ProtocolEvent, ProtocolError> {
-        if let Some(channel) = self.channels.get(&frame.topic)
-            && frame.join_ref.is_some()
-            && frame.join_ref.as_deref() != Some(channel.join_ref.as_str())
-        {
+        if self.channels.get(&frame.topic).is_some_and(|channel| {
+            frame.join_ref.is_some() && frame.join_ref.as_deref() != Some(channel.join_ref.as_str())
+        }) {
             return Ok(ProtocolEvent::StaleMessage(frame));
         }
 
@@ -487,6 +486,7 @@ pub enum ProtocolError {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -508,6 +508,33 @@ mod tests {
             .unwrap();
         protocol.receive(reply(&join, "ok", json!({}))).unwrap();
         protocol
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_state_transitions_never_panic(actions in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let mut protocol = Protocol::new();
+            for action in actions {
+                match action % 7 {
+                    0 => { let _ = protocol.join("room:lobby", json!({})); }
+                    1 => {
+                        let frame = Frame::new(
+                            Some((action / 7).to_string()),
+                            Some(action.to_string()),
+                            "room:lobby",
+                            if action & 1 == 0 { "phx_error" } else { "event" },
+                            json!({}),
+                        );
+                        let _ = protocol.receive(frame);
+                    }
+                    2 => { let _ = protocol.reset_connection(); }
+                    3 => { let _ = protocol.discard_channel("room:lobby"); }
+                    4 => { let _ = protocol.heartbeat(); }
+                    5 => { let _ = protocol.leave("room:lobby"); }
+                    _ => { let _ = protocol.push("room:lobby", "event", json!({})); }
+                }
+            }
+        }
     }
 
     #[test]

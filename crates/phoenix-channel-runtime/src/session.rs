@@ -23,7 +23,7 @@ pub struct Session<T> {
 
 impl<T: Transport> Session<T> {
     pub fn new(transport: T) -> Self {
-        Self::with_codec(transport, PhoenixV2Codec)
+        Self::with_codec(transport, PhoenixV2Codec::limited(Default::default()))
     }
 
     pub fn with_codec(transport: T, codec: impl Codec + 'static) -> Self {

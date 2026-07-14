@@ -29,8 +29,8 @@ use futures::{
 };
 use phoenix_channel_runtime::{
     ChannelState, Codec, EventRoute, Frame, Payload, PayloadError, PhoenixV2Codec, Protocol,
-    ProtocolEvent, ReplyStatus, Transport, TransportClose, TransportError, TransportErrorKind,
-    TransportEvent, WireMessage,
+    ProtocolEvent, ReplyStatus, Transport, TransportClose, TransportCloseRequest, TransportError,
+    TransportErrorKind, TransportEvent, WireMessage,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -156,6 +156,10 @@ pub enum ClientError {
     PushBufferFull(String),
     #[error("a channel already exists for topic {0}")]
     DuplicateChannel(String),
+    #[error("channel {0} is already joined")]
+    AlreadyJoined(String),
+    #[error("channel {0} must be joined again before sending events")]
+    ChannelNotJoined(String),
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
         operation: ClientOperation,
@@ -270,7 +274,12 @@ impl Socket {
         timer: impl Timer + 'static,
         options: Options,
     ) -> (Self, Driver) {
-        Self::new_with_codec(connector, timer, options, PhoenixV2Codec)
+        Self::new_with_codec(
+            connector,
+            timer,
+            options,
+            PhoenixV2Codec::limited(Default::default()),
+        )
     }
 
     pub fn new_with_codec(
@@ -381,10 +390,26 @@ impl Socket {
     }
 
     pub async fn disconnect(&self) -> Result<(), ClientError> {
+        self.disconnect_inner(None).await
+    }
+
+    pub async fn disconnect_with(
+        &self,
+        code: u16,
+        reason: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.disconnect_inner(Some(TransportCloseRequest::new(code, reason)))
+            .await
+    }
+
+    async fn disconnect_inner(
+        &self,
+        close: Option<TransportCloseRequest>,
+    ) -> Result<(), ClientError> {
         let (response, receiver) = oneshot::channel();
         let mut commands = self.commands.clone();
         commands
-            .send(Command::Disconnect { response })
+            .send(Command::Disconnect { close, response })
             .await
             .map_err(|_| ClientError::DriverStopped)?;
         receiver.await.map_err(|_| ClientError::DriverStopped)
@@ -450,15 +475,20 @@ impl Channel {
     }
 
     pub async fn join(&self) -> Result<Payload, ClientError> {
+        self.join_with_timeout(self.timeouts.join).await
+    }
+
+    pub async fn join_with_timeout(&self, timeout: Duration) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
         self.send(Command::Join {
             id,
             topic: self.topic.clone(),
+            timeout,
             response,
         })
         .await?;
-        self.wait(id, ClientOperation::Join, self.timeouts.join, receiver)
+        self.wait(id, ClientOperation::Join, timeout, receiver)
             .await
     }
 
@@ -466,6 +496,16 @@ impl Channel {
         &self,
         event: impl Into<String>,
         payload: impl Into<Payload>,
+    ) -> Result<Reply, ClientError> {
+        self.call_with_timeout(event, payload, self.timeouts.call)
+            .await
+    }
+
+    pub async fn call_with_timeout(
+        &self,
+        event: impl Into<String>,
+        payload: impl Into<Payload>,
+        timeout: Duration,
     ) -> Result<Reply, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -477,7 +517,7 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, ClientOperation::Call, self.timeouts.call, receiver)
+        self.wait(id, ClientOperation::Call, timeout, receiver)
             .await
     }
 
@@ -486,6 +526,16 @@ impl Channel {
         &self,
         event: impl Into<String>,
         payload: impl Into<Payload>,
+    ) -> Result<(), ClientError> {
+        self.cast_with_timeout(event, payload, self.timeouts.call)
+            .await
+    }
+
+    pub async fn cast_with_timeout(
+        &self,
+        event: impl Into<String>,
+        payload: impl Into<Payload>,
+        timeout: Duration,
     ) -> Result<(), ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -497,20 +547,25 @@ impl Channel {
             response,
         })
         .await?;
-        self.wait(id, ClientOperation::Cast, self.timeouts.call, receiver)
+        self.wait(id, ClientOperation::Cast, timeout, receiver)
             .await
     }
 
     pub async fn leave(&self) -> Result<Payload, ClientError> {
+        self.leave_with_timeout(self.timeouts.leave).await
+    }
+
+    pub async fn leave_with_timeout(&self, timeout: Duration) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
         self.send(Command::Leave {
             id,
             topic: self.topic.clone(),
+            timeout,
             response,
         })
         .await?;
-        self.wait(id, ClientOperation::Leave, self.timeouts.leave, receiver)
+        self.wait(id, ClientOperation::Leave, timeout, receiver)
             .await
     }
 
@@ -655,6 +710,7 @@ enum Command {
         response: oneshot::Sender<()>,
     },
     Disconnect {
+        close: Option<TransportCloseRequest>,
         response: oneshot::Sender<()>,
     },
     Subscribe {
@@ -667,6 +723,7 @@ enum Command {
     Join {
         id: RequestId,
         topic: String,
+        timeout: Duration,
         response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Call {
@@ -686,6 +743,7 @@ enum Command {
     Leave {
         id: RequestId,
         topic: String,
+        timeout: Duration,
         response: oneshot::Sender<Result<Payload, ClientError>>,
     },
     Shutdown {
@@ -743,6 +801,7 @@ struct ChannelRecord {
     ever_joined: bool,
     active_payload: Option<u64>,
     join_attempt: u32,
+    join_timeout: Duration,
     rejoin_scheduled: bool,
     join_waiters: HashMap<RequestId, oneshot::Sender<Result<Payload, ClientError>>>,
     queued: VecDeque<QueuedPush>,
@@ -761,14 +820,23 @@ struct PendingCall {
 
 struct PendingLeave {
     id: RequestId,
+    timeout: Duration,
     response: Option<oneshot::Sender<Result<Payload, ClientError>>>,
 }
 
 type PayloadResult = (String, u64, Result<Value, String>);
 
 enum OperationTimeout {
-    Join { topic: String, reference: String },
-    Leave { topic: String, reference: String },
+    Join {
+        topic: String,
+        reference: String,
+        duration: Duration,
+    },
+    Leave {
+        topic: String,
+        reference: String,
+        duration: Duration,
+    },
 }
 
 struct DriverState {
@@ -857,7 +925,7 @@ impl DriverState {
                         Some(Command::Connect { response }) => {
                             let _ = response.send(());
                         }
-                        Some(Command::Disconnect { response }) => {
+                        Some(Command::Disconnect { response, .. }) => {
                             break Some(ConnectAttemptExit::Disconnect(response));
                         }
                         Some(Command::Shutdown { response }) => {
@@ -886,8 +954,12 @@ impl DriverState {
                             self.emit_socket(SocketEvent::Closed);
                             return;
                         }
-                        ConnectedExit::Disconnect(response) => {
-                            let _ = transport.close().await;
+                        ConnectedExit::Disconnect { response, close } => {
+                            if let Some(close) = close {
+                                let _ = transport.close_with(close).await;
+                            } else {
+                                let _ = transport.close().await;
+                            }
                             self.on_disconnect(&DisconnectReason::Requested);
                             let _ = response.send(());
                             connection_enabled = false;
@@ -952,7 +1024,7 @@ impl DriverState {
                 },
                 command = command => match command {
                     Some(Command::Connect { response }) => return IdleExit::Connect(response),
-                    Some(Command::Disconnect { response }) => {
+                    Some(Command::Disconnect { response, .. }) => {
                         let _ = response.send(());
                     }
                     Some(Command::Shutdown { response }) => return IdleExit::Shutdown(response),
@@ -982,7 +1054,7 @@ impl DriverState {
                     Some(Command::Connect { response }) => {
                         let _ = response.send(());
                     }
-                    Some(Command::Disconnect { response }) => {
+                    Some(Command::Disconnect { response, .. }) => {
                         return OfflineExit::Disconnect(response);
                     }
                     Some(Command::Shutdown { response }) => return OfflineExit::Shutdown(response),
@@ -1086,8 +1158,8 @@ impl DriverState {
                 Action::Command(Some(Command::Shutdown { response })) => {
                     return ConnectedExit::Shutdown(response);
                 }
-                Action::Command(Some(Command::Disconnect { response })) => {
-                    return ConnectedExit::Disconnect(response);
+                Action::Command(Some(Command::Disconnect { close, response })) => {
+                    return ConnectedExit::Disconnect { response, close };
                 }
                 Action::Command(Some(Command::Connect { response })) => {
                     let _ = response.send(());
@@ -1199,10 +1271,12 @@ impl DriverState {
             Command::Join {
                 id,
                 topic,
+                timeout,
                 response,
             } => {
                 if let Some(channel) = self.channels.get_mut(&topic) {
                     channel.desired = true;
+                    channel.join_timeout = channel.join_timeout.max(timeout);
                     channel.status.set(ChannelStatus::WaitingForSocket);
                     channel.join_waiters.insert(id, response);
                 } else {
@@ -1303,6 +1377,7 @@ impl DriverState {
             Command::Join {
                 id,
                 topic,
+                timeout,
                 response,
             } => {
                 let joined = self.protocol.channel_state(&topic) == Some(ChannelState::Joined);
@@ -1310,9 +1385,10 @@ impl DriverState {
                     channel.desired = true;
                     if joined {
                         channel.status.set(ChannelStatus::Joined);
-                        let _ = response.send(Ok(json!({}).into()));
+                        let _ = response.send(Err(ClientError::AlreadyJoined(topic)));
                     } else {
                         channel.status.set(ChannelStatus::WaitingToJoin);
+                        channel.join_timeout = channel.join_timeout.max(timeout);
                         channel.join_waiters.insert(id, response);
                         self.load_payload(&topic, payloads);
                     }
@@ -1361,6 +1437,7 @@ impl DriverState {
             Command::Leave {
                 id,
                 topic,
+                timeout,
                 response,
             } => {
                 let state = self.protocol.channel_state(&topic);
@@ -1383,6 +1460,7 @@ impl DriverState {
                         outbound.reference.clone(),
                         PendingLeave {
                             id,
+                            timeout,
                             response: Some(response),
                         },
                     );
@@ -1390,6 +1468,7 @@ impl DriverState {
                         OperationTimeout::Leave {
                             topic,
                             reference: outbound.reference.clone(),
+                            duration: timeout,
                         },
                         operation_timeouts,
                     );
@@ -1398,6 +1477,7 @@ impl DriverState {
                     if let Some(channel) = self.channels.get_mut(&topic) {
                         channel.deferred_leave = Some(PendingLeave {
                             id,
+                            timeout,
                             response: Some(response),
                         });
                     } else {
@@ -1433,6 +1513,7 @@ impl DriverState {
             ever_joined: false,
             active_payload: None,
             join_attempt: 0,
+            join_timeout: self.options.join_timeout,
             rejoin_scheduled: false,
             join_waiters: HashMap::new(),
             queued: VecDeque::new(),
@@ -1457,6 +1538,10 @@ impl DriverState {
 
     fn queue(&mut self, topic: &str, push: QueuedPush) {
         if let Some(channel) = self.channels.get_mut(topic) {
+            if channel.ever_joined && !channel.desired {
+                push.fail(ClientError::ChannelNotJoined(topic.to_owned()));
+                return;
+            }
             if channel.queued.len() < self.options.push_buffer_capacity {
                 channel.queued.push_back(push);
             } else {
@@ -1536,6 +1621,7 @@ impl DriverState {
                 return Ok(());
             }
         };
+        let join_timeout = channel.join_timeout;
         let outbound = match self.protocol.channel_state(&topic) {
             Some(ChannelState::Disconnected | ChannelState::Errored | ChannelState::Closed) => {
                 self.protocol.rejoin(&topic, payload)
@@ -1553,6 +1639,7 @@ impl DriverState {
             OperationTimeout::Join {
                 topic,
                 reference: outbound.reference.clone(),
+                duration: join_timeout,
             },
             operation_timeouts,
         );
@@ -1610,6 +1697,7 @@ impl DriverState {
                 };
                 self.emit_channel(topic, ChannelEvent::Protocol(event.clone()));
                 if let Some(pending) = deferred_leave {
+                    let timeout = pending.timeout;
                     let outbound = self
                         .protocol
                         .leave(topic)
@@ -1620,6 +1708,7 @@ impl DriverState {
                         OperationTimeout::Leave {
                             topic: topic.clone(),
                             reference: outbound.reference.clone(),
+                            duration: timeout,
                         },
                         operation_timeouts,
                     );
@@ -1762,8 +1851,9 @@ impl DriverState {
     ) {
         let timer = self.timer.clone();
         let timeout = match operation {
-            OperationTimeout::Join { .. } => self.options.join_timeout,
-            OperationTimeout::Leave { .. } => self.options.leave_timeout,
+            OperationTimeout::Join { duration, .. } | OperationTimeout::Leave { duration, .. } => {
+                duration
+            }
         };
         timeouts.push(Box::pin(async move {
             timer.sleep(timeout).await;
@@ -1778,7 +1868,11 @@ impl DriverState {
         rejoins: &mut FuturesUnordered<LocalBoxFuture<'static, String>>,
     ) -> Result<(), DisconnectReason> {
         match timeout {
-            OperationTimeout::Join { topic, reference } => {
+            OperationTimeout::Join {
+                topic,
+                reference,
+                duration,
+            } => {
                 if self.pending_joins.remove(&reference).as_deref() != Some(topic.as_str()) {
                     return Ok(());
                 }
@@ -1790,7 +1884,7 @@ impl DriverState {
                         if let Some(response) = pending.response {
                             let _ = response.send(Err(ClientError::Timeout {
                                 operation: ClientOperation::Leave,
-                                timeout: self.options.leave_timeout,
+                                timeout: pending.timeout,
                             }));
                         }
                         channel.status.set(ChannelStatus::Left);
@@ -1799,7 +1893,7 @@ impl DriverState {
                         for (_, waiter) in channel.join_waiters.drain() {
                             let _ = waiter.send(Err(ClientError::Timeout {
                                 operation: ClientOperation::Join,
-                                timeout: self.options.join_timeout,
+                                timeout: duration,
                             }));
                         }
                         should_rejoin = true;
@@ -1811,14 +1905,18 @@ impl DriverState {
                     self.schedule_rejoin(&topic, rejoins);
                 }
             }
-            OperationTimeout::Leave { topic, reference } => {
+            OperationTimeout::Leave {
+                topic,
+                reference,
+                duration,
+            } => {
                 let Some(pending) = self.pending_leaves.remove(&reference) else {
                     return Ok(());
                 };
                 if let Some(response) = pending.response {
                     let _ = response.send(Err(ClientError::Timeout {
                         operation: ClientOperation::Leave,
-                        timeout: self.options.leave_timeout,
+                        timeout: duration,
                     }));
                 }
                 self.protocol.discard_channel(&topic);
@@ -1930,8 +2028,28 @@ impl DriverState {
     }
 
     fn cancel(&mut self, id: RequestId) {
+        let cancelled_join = self.channels.iter_mut().find_map(|(topic, channel)| {
+            channel.join_waiters.remove(&id).map(|_| {
+                (
+                    topic.clone(),
+                    channel.join_waiters.is_empty() && !channel.ever_joined,
+                )
+            })
+        });
+        if let Some((topic, stop_join)) = cancelled_join {
+            if stop_join {
+                if let Some(channel) = self.channels.get_mut(&topic) {
+                    channel.desired = false;
+                    channel.active_payload = None;
+                    channel.status.set(ChannelStatus::Left);
+                }
+                self.pending_joins
+                    .retain(|_, pending_topic| pending_topic != &topic);
+                self.protocol.discard_channel(&topic);
+            }
+            return;
+        }
         for channel in self.channels.values_mut() {
-            channel.join_waiters.remove(&id);
             if let Some(pending) = channel
                 .deferred_leave
                 .as_mut()
@@ -2122,7 +2240,10 @@ fn send_bounded<T: Clone + LaggedEvent>(subscriber: &mut EventSubscriber<T>, eve
 
 enum ConnectedExit {
     Shutdown(oneshot::Sender<()>),
-    Disconnect(oneshot::Sender<()>),
+    Disconnect {
+        response: oneshot::Sender<()>,
+        close: Option<TransportCloseRequest>,
+    },
     Disconnected(DisconnectReason),
 }
 

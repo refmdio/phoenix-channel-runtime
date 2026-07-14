@@ -71,6 +71,35 @@ struct ClosingTransport {
     close: Option<TransportClose>,
 }
 
+struct CloseCaptureTransport {
+    close: Rc<RefCell<Option<TransportCloseRequest>>>,
+}
+
+impl Transport for CloseCaptureTransport {
+    fn send<'a>(
+        &'a mut self,
+        _message: WireMessage,
+    ) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn receive<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
+        Box::pin(futures::future::pending())
+    }
+
+    fn close<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn close_with<'a>(
+        &'a mut self,
+        request: TransportCloseRequest,
+    ) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        *self.close.borrow_mut() = Some(request);
+        Box::pin(async { Ok(()) })
+    }
+}
+
 impl Transport for ClosingTransport {
     fn send<'a>(
         &'a mut self,
@@ -191,6 +220,27 @@ fn stops_after_a_clean_transport_close() {
         socket.shutdown().await.unwrap();
         assert_eq!(events.next().await, Some(SocketEvent::Closed));
         assert_eq!(socket.status(), SocketStatus::Closed);
+    });
+}
+
+#[test]
+fn forwards_explicit_websocket_close_details() {
+    let captured = Rc::new(RefCell::new(None));
+    let transport: Box<dyn Transport> = Box::new(CloseCaptureTransport {
+        close: captured.clone(),
+    });
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    pool.spawner().spawn_local(driver).unwrap();
+    pool.run_until(async move {
+        socket.disconnect_with(1000, "complete").await.unwrap();
+        assert_eq!(
+            captured.borrow().as_ref(),
+            Some(&TransportCloseRequest::new(1000, "complete"))
+        );
+        socket.shutdown().await.unwrap();
     });
 }
 
@@ -596,6 +646,7 @@ fn retries_a_join_after_its_wire_request_times_out() {
             .send(Command::Join {
                 id,
                 topic: channel.topic.clone(),
+                timeout: request_timeout,
                 response,
             })
             .await
@@ -673,6 +724,7 @@ fn rejoins_after_an_error_while_joining() {
             .send(Command::Join {
                 id,
                 topic: channel.topic.clone(),
+                timeout: request_timeout,
                 response,
             })
             .await
@@ -866,6 +918,85 @@ fn exposes_socket_and_channel_lifecycle_status() {
         socket.shutdown().await.unwrap();
         assert_eq!(socket.status(), SocketStatus::Closed);
         assert_eq!(channel.status(), ChannelStatus::Closed);
+    });
+}
+
+#[test]
+fn enforces_channel_handle_and_join_state_invariants() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    let channel = socket
+        .channel("room:lobby", static_join_payload(json!({})))
+        .unwrap();
+    let duplicate = socket.channel("room:lobby", static_join_payload(json!({})));
+    assert!(matches!(
+        duplicate,
+        Err(ClientError::DuplicateChannel(topic)) if topic == "room:lobby"
+    ));
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let server = async {
+            let join = next_frame(&mut peer).await;
+            reply(&peer, &join, "ok", json!({}));
+        };
+        let (_, joined) = futures::join!(server, channel.join());
+        joined.unwrap();
+        assert_eq!(
+            channel.join().await.unwrap_err(),
+            ClientError::AlreadyJoined("room:lobby".into())
+        );
+
+        let server = async {
+            let leave = next_frame(&mut peer).await;
+            reply(&peer, &leave, "ok", json!({}));
+        };
+        let (_, left) = futures::join!(server, channel.leave());
+        left.unwrap();
+        assert_eq!(
+            channel.call("after_leave", json!({})).await.unwrap_err(),
+            ClientError::ChannelNotJoined("room:lobby".into())
+        );
+        socket.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn applies_per_operation_timeout_overrides() {
+    let (transport, _peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let custom_timeout = Duration::from_millis(17);
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    let channel = socket
+        .channel("room:lobby", static_join_payload(json!({})))
+        .unwrap();
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let call = channel.call_with_timeout("queued", json!({}), custom_timeout);
+        let fire_timeout = async {
+            loop {
+                let request = timer_requests.next().await.unwrap();
+                if request.duration == custom_timeout {
+                    request.fire.send(()).unwrap();
+                    break;
+                }
+            }
+        };
+        let (result, ()) = futures::join!(call, fire_timeout);
+        assert_eq!(
+            result.unwrap_err(),
+            ClientError::Timeout {
+                operation: ClientOperation::Call,
+                timeout: custom_timeout,
+            }
+        );
+        socket.shutdown().await.unwrap();
     });
 }
 
@@ -1107,6 +1238,7 @@ fn continues_a_queued_rejoin_after_leave_times_out() {
             .send(Command::Join {
                 id: join_id,
                 topic: channel.topic.clone(),
+                timeout: request_timeout,
                 response: join_response,
             })
             .await
@@ -1131,6 +1263,7 @@ fn continues_a_queued_rejoin_after_leave_times_out() {
             .send(Command::Leave {
                 id: leave_id,
                 topic: channel.topic.clone(),
+                timeout: request_timeout,
                 response: leave_response,
             })
             .await
@@ -1144,6 +1277,7 @@ fn continues_a_queued_rejoin_after_leave_times_out() {
             .send(Command::Join {
                 id: rejoin_id,
                 topic: channel.topic.clone(),
+                timeout: request_timeout,
                 response: rejoin_response,
             })
             .await

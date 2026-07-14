@@ -10,10 +10,20 @@ use super::ConnectContext;
 
 const AUTH_TOKEN_PREFIX: &str = "base64url.bearer.phx.";
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 pub struct ConnectionConfig {
     pub params: Vec<(String, String)>,
     pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectionConfig")
+            .field("params", &self.params)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "redacted"))
+            .finish()
+    }
 }
 
 impl ConnectionConfig {
@@ -106,10 +116,31 @@ impl Endpoint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ResolvedEndpoint {
     pub url: String,
     pub protocols: Vec<String>,
+}
+
+impl std::fmt::Debug for ResolvedEndpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let protocols = self
+            .protocols
+            .iter()
+            .map(|protocol| {
+                if protocol.starts_with(AUTH_TOKEN_PREFIX) {
+                    "redacted"
+                } else {
+                    protocol.as_str()
+                }
+            })
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("ResolvedEndpoint")
+            .field("url", &self.url)
+            .field("protocols", &protocols)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -157,6 +188,24 @@ mod tests {
                 ["phoenix", "base64url.bearer.phx.MTIzNA"]
             );
         });
+    }
+
+    #[test]
+    fn debug_output_redacts_authentication_secrets() {
+        let config = ConnectionConfig::default().auth_token("secret-token");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("secret-token"));
+
+        let endpoint = futures::executor::block_on(async {
+            Endpoint::new("wss://example.test/socket")
+                .unwrap()
+                .connection_config(config)
+                .resolve(ConnectContext { attempt: 0 })
+                .await
+                .unwrap()
+        });
+        let debug = format!("{endpoint:?}");
+        assert!(!debug.contains("c2VjcmV0LXRva2Vu"));
     }
 
     #[test]

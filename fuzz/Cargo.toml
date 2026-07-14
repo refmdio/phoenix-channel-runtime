@@ -1,0 +1,21 @@
+[package]
+name = "phoenix-channel-runtime-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+phoenix-channel-runtime = { path = "../crates/phoenix-channel-runtime" }
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

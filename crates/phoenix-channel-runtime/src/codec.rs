@@ -11,8 +11,40 @@ pub trait Codec {
     fn decode(&self, message: WireMessage) -> Result<Frame, CodecError>;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CodecLimits {
+    pub max_frame_bytes: usize,
+    pub max_binary_payload_bytes: usize,
+}
+
+impl Default for CodecLimits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: 16 * 1024 * 1024,
+            max_binary_payload_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PhoenixV2Codec;
+
+impl PhoenixV2Codec {
+    pub fn limited(limits: CodecLimits) -> LimitedPhoenixV2Codec {
+        LimitedPhoenixV2Codec { limits }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LimitedPhoenixV2Codec {
+    limits: CodecLimits,
+}
+
+impl LimitedPhoenixV2Codec {
+    pub fn limits(&self) -> CodecLimits {
+        self.limits
+    }
+}
 
 impl Codec for PhoenixV2Codec {
     fn encode(&self, frame: &Frame) -> Result<WireMessage, CodecError> {
@@ -29,6 +61,56 @@ impl Codec for PhoenixV2Codec {
             WireMessage::Binary(bytes) => decode_binary(&bytes),
         }
     }
+}
+
+impl Codec for LimitedPhoenixV2Codec {
+    fn encode(&self, frame: &Frame) -> Result<WireMessage, CodecError> {
+        validate_payload_size(&frame.payload, self.limits)?;
+        let message = PhoenixV2Codec.encode(frame)?;
+        validate_frame_size(&message, self.limits)?;
+        Ok(message)
+    }
+
+    fn decode(&self, message: WireMessage) -> Result<Frame, CodecError> {
+        validate_frame_size(&message, self.limits)?;
+        let frame = PhoenixV2Codec.decode(message)?;
+        validate_payload_size(&frame.payload, self.limits)?;
+        Ok(frame)
+    }
+}
+
+fn validate_frame_size(message: &WireMessage, limits: CodecLimits) -> Result<(), CodecError> {
+    let length = match message {
+        WireMessage::Text(text) => text.len(),
+        WireMessage::Binary(bytes) => bytes.len(),
+    };
+    if length > limits.max_frame_bytes {
+        return Err(CodecError::FrameTooLarge {
+            length,
+            maximum: limits.max_frame_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_payload_size(payload: &Payload, limits: CodecLimits) -> Result<(), CodecError> {
+    let length = match payload {
+        Payload::Binary(bytes) => Some(bytes.len()),
+        Payload::Reply { response, .. } => match response.as_ref() {
+            Payload::Binary(bytes) => Some(bytes.len()),
+            _ => None,
+        },
+        Payload::Json(_) => None,
+    };
+    if let Some(length) = length {
+        if length > limits.max_binary_payload_bytes {
+            return Err(CodecError::BinaryPayloadTooLarge {
+                length,
+                maximum: limits.max_binary_payload_bytes,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn encode_push(frame: &Frame, payload: &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -161,10 +243,15 @@ pub enum CodecError {
     FieldTooLong { field: &'static str, length: usize },
     #[error("reply envelope cannot be sent as an application payload")]
     InvalidOutboundReplyPayload,
+    #[error("Phoenix frame is {length} bytes, exceeding the {maximum}-byte limit")]
+    FrameTooLarge { length: usize, maximum: usize },
+    #[error("Phoenix binary payload is {length} bytes, exceeding the {maximum}-byte limit")]
+    BinaryPayloadTooLarge { length: usize, maximum: usize },
 }
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use serde_json::json;
 
     use super::*;
@@ -216,5 +303,47 @@ mod tests {
             PhoenixV2Codec.encode(&text).unwrap(),
             WireMessage::Text(_)
         ));
+    }
+
+    #[test]
+    fn enforces_frame_and_binary_payload_limits() {
+        let codec = PhoenixV2Codec::limited(CodecLimits {
+            max_frame_bytes: 64,
+            max_binary_payload_bytes: 2,
+        });
+        let frame = Frame::new(None, None, "room", "binary", vec![1, 2, 3]);
+        assert!(matches!(
+            codec.encode(&frame),
+            Err(CodecError::BinaryPayloadTooLarge { .. })
+        ));
+
+        let codec = PhoenixV2Codec::limited(CodecLimits {
+            max_frame_bytes: 4,
+            max_binary_payload_bytes: 4,
+        });
+        assert!(matches!(
+            codec.decode(WireMessage::Text("[null,null,\"room\",\"e\",{}]".into())),
+            Err(CodecError::FrameTooLarge { .. })
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_binary_frames_never_panic(input in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let codec = PhoenixV2Codec::limited(CodecLimits {
+                max_frame_bytes: 2048,
+                max_binary_payload_bytes: 1024,
+            });
+            let _ = codec.decode(WireMessage::Binary(input));
+        }
+
+        #[test]
+        fn arbitrary_text_frames_never_panic(input in ".{0,4096}") {
+            let codec = PhoenixV2Codec::limited(CodecLimits {
+                max_frame_bytes: 2048,
+                max_binary_payload_bytes: 1024,
+            });
+            let _ = codec.decode(WireMessage::Text(input));
+        }
     }
 }

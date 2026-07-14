@@ -15,6 +15,21 @@ pub struct TransportClose {
     pub was_clean: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportCloseRequest {
+    pub code: u16,
+    pub reason: String,
+}
+
+impl TransportCloseRequest {
+    pub fn new(code: u16, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+        }
+    }
+}
+
 impl TransportClose {
     pub fn new(code: Option<u16>, reason: impl Into<String>, was_clean: bool) -> Self {
         Self {
@@ -56,6 +71,14 @@ pub trait Transport {
     fn receive<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<TransportEvent, TransportError>>;
 
     fn close<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), TransportError>>;
+
+    fn close_with<'a>(
+        &'a mut self,
+        request: TransportCloseRequest,
+    ) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        let _ = request;
+        self.close()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
