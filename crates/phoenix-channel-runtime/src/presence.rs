@@ -101,7 +101,7 @@ pub enum PresenceUpdate {
     Synced(PresenceDiff),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct PresenceTracker {
     state: PresenceState,
     join_ref: Option<String>,
@@ -113,17 +113,21 @@ pub struct PresenceTracker {
 impl PresenceTracker {
     pub fn new() -> Self {
         Self {
+            state: PresenceState::default(),
+            join_ref: None,
+            pending_diffs: Vec::new(),
             state_event: "presence_state".into(),
             diff_event: "presence_diff".into(),
-            ..Self::default()
         }
     }
 
     pub fn with_events(state_event: impl Into<String>, diff_event: impl Into<String>) -> Self {
         Self {
+            state: PresenceState::default(),
+            join_ref: None,
+            pending_diffs: Vec::new(),
             state_event: state_event.into(),
             diff_event: diff_event.into(),
-            ..Self::default()
         }
     }
 
@@ -163,6 +167,12 @@ impl PresenceTracker {
         } else {
             unreachable!("presence event names were checked before decoding")
         }
+    }
+}
+
+impl Default for PresenceTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
