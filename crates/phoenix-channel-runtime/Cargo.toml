@@ -1,0 +1,14 @@
+[package]
+name = "phoenix-channel-runtime"
+description = "Runtime-independent Phoenix Channels v2 protocol state machine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

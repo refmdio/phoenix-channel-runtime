@@ -1,0 +1,22 @@
+[package]
+name = "phoenix-channel-runtime-native"
+description = "Native WebSocket transport for phoenix-channel-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phoenix-channel-runtime = { path = "../phoenix-channel-runtime" }
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+futures.workspace = true
+tokio = { version = "1.49.0", features = ["macros", "net", "rt"] }
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+
+[[example]]
+name = "join"
+path = "examples/join.rs"
+required-features = []
