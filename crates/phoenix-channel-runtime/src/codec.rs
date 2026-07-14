@@ -6,14 +6,20 @@ const PUSH: u8 = 0;
 const REPLY: u8 = 1;
 const BROADCAST: u8 = 2;
 
+/// Encodes and decodes Phoenix frames for a transport.
 pub trait Codec {
+    /// Encodes a protocol frame into a text or binary wire message.
     fn encode(&self, frame: &Frame) -> Result<WireMessage, CodecError>;
+    /// Decodes a text or binary wire message into a protocol frame.
     fn decode(&self, message: WireMessage) -> Result<Frame, CodecError>;
 }
 
+/// Maximum accepted sizes for encoded frames and binary payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodecLimits {
+    /// Maximum total wire-frame size in bytes.
     pub max_frame_bytes: usize,
+    /// Maximum binary payload size in bytes.
     pub max_binary_payload_bytes: usize,
 }
 
@@ -26,21 +32,25 @@ impl Default for CodecLimits {
     }
 }
 
+/// Phoenix Channels v2 JSON and binary codec without size limits.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PhoenixV2Codec;
 
 impl PhoenixV2Codec {
+    /// Creates a Phoenix v2 codec that enforces `limits`.
     pub fn limited(limits: CodecLimits) -> LimitedPhoenixV2Codec {
         LimitedPhoenixV2Codec { limits }
     }
 }
 
+/// Phoenix Channels v2 codec with configurable frame and payload limits.
 #[derive(Clone, Copy, Debug)]
 pub struct LimitedPhoenixV2Codec {
     limits: CodecLimits,
 }
 
 impl LimitedPhoenixV2Codec {
+    /// Returns the configured size limits.
     pub fn limits(&self) -> CodecLimits {
         self.limits
     }
@@ -229,24 +239,48 @@ fn field_size(value: &[u8], field: &'static str) -> Result<u8, CodecError> {
     })
 }
 
+/// Failure while encoding or decoding a Phoenix v2 wire message.
 #[derive(Debug, Error)]
 pub enum CodecError {
+    /// A text frame could not be encoded or decoded.
     #[error(transparent)]
     Text(#[from] FrameCodecError),
+    /// A binary frame ended before all declared fields were present.
     #[error("Phoenix binary frame is truncated")]
     TruncatedBinaryFrame,
+    /// A binary frame used an unknown Phoenix serializer kind byte.
     #[error("unknown Phoenix binary frame kind: {0}")]
     UnknownBinaryKind(u8),
+    /// A binary-frame string field was not valid UTF-8.
     #[error("Phoenix binary frame contains invalid UTF-8 in {0}")]
     InvalidUtf8(&'static str),
+    /// A binary-frame field exceeded the serializer's one-byte length.
     #[error("Phoenix binary {field} field exceeds 255 bytes: {length}")]
-    FieldTooLong { field: &'static str, length: usize },
+    FieldTooLong {
+        /// Name of the oversized field.
+        field: &'static str,
+        /// Encoded field length.
+        length: usize,
+    },
+    /// An outbound reply payload had a shape unsupported by the serializer.
     #[error("reply envelope cannot be sent as an application payload")]
     InvalidOutboundReplyPayload,
+    /// The complete encoded frame exceeded the configured limit.
     #[error("Phoenix frame is {length} bytes, exceeding the {maximum}-byte limit")]
-    FrameTooLarge { length: usize, maximum: usize },
+    FrameTooLarge {
+        /// Actual frame size.
+        length: usize,
+        /// Configured maximum frame size.
+        maximum: usize,
+    },
+    /// The binary payload exceeded the configured limit.
     #[error("Phoenix binary payload is {length} bytes, exceeding the {maximum}-byte limit")]
-    BinaryPayloadTooLarge { length: usize, maximum: usize },
+    BinaryPayloadTooLarge {
+        /// Actual payload size.
+        length: usize,
+        /// Configured maximum payload size.
+        maximum: usize,
+    },
 }
 
 #[cfg(test)]

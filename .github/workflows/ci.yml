@@ -24,6 +24,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - if: matrix.rust == 'stable'
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo doc --workspace --all-features --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace --all-features
 
   wasm:
@@ -36,6 +40,7 @@ jobs:
       - run: cargo check -p phoenix-channel-runtime --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-client --all-features --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-runtime-web --target wasm32-unknown-unknown
+      - run: cargo rustdoc -p phoenix-channel-runtime-web --target wasm32-unknown-unknown -- -D warnings
 
   package:
     runs-on: ubuntu-latest

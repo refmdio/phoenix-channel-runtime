@@ -45,43 +45,66 @@ use thiserror::Error;
 
 type RequestId = u64;
 
+/// Socket connection and reconnect lifecycle notification.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SocketEvent {
+    /// A transport connection attempt started.
     Connecting {
+        /// Zero-based attempt number for the connection cycle.
         attempt: u32,
     },
+    /// The transport connected successfully.
     Connected,
+    /// The connection ended or was explicitly disconnected.
     Disconnected {
+        /// Condition that ended the connection.
         reason: DisconnectReason,
     },
+    /// An automatic reconnect was scheduled.
     ReconnectScheduled {
+        /// Reconnect attempt number.
         attempt: u32,
+        /// Delay before the next connection attempt.
         delay: Duration,
     },
+    /// The reconnect policy chose not to retry.
     ReconnectStopped {
+        /// Reconnect attempt number at which retries stopped.
         attempt: u32,
+        /// Condition supplied to the reconnect policy.
         reason: DisconnectReason,
     },
+    /// The client driver shut down permanently.
     Closed,
+    /// This bounded event subscriber fell behind.
     Lagged {
+        /// Number of events dropped before the lag notification.
         dropped: u64,
     },
 }
 
+/// Condition that disconnected a managed socket.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum DisconnectReason {
+    /// The application requested a disconnect.
     #[error("connection closed by request")]
     Requested,
+    /// Establishing the transport failed.
     #[error("connection failed: {0}")]
     Connect(TransportError),
+    /// An established transport operation failed.
     #[error("transport failed: {0}")]
     Transport(TransportError),
+    /// The transport reported a close frame or ended.
     #[error("connection closed: {0:?}")]
     Closed(TransportClose),
+    /// An automatic heartbeat acknowledgement did not arrive in time.
     #[error("heartbeat acknowledgement timed out")]
     HeartbeatTimeout,
+    /// Incoming data violated managed protocol expectations.
     #[error("protocol failed: {0}")]
     Protocol(String),
+    /// The driver ended before completing a connection operation.
     #[error("client driver stopped")]
     DriverStopped,
 }
@@ -98,24 +121,41 @@ impl DisconnectReason {
     }
 }
 
+/// Observable socket lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocketStatus {
+    /// No transport is active and no retry is scheduled.
     Disconnected,
+    /// A transport connection attempt is active.
     Connecting,
+    /// A transport is connected.
     Connected,
+    /// The reconnect policy scheduled a future attempt.
     WaitingToReconnect,
+    /// The driver shut down permanently.
     Closed,
 }
 
+/// Protocol or lifecycle notification for one channel topic.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChannelEvent {
+    /// A semantic Phoenix protocol event.
     Protocol(ProtocolEvent),
+    /// The underlying socket disconnected.
     Disconnected,
+    /// The join payload loader failed.
     JoinPayloadError(String),
-    Lagged { dropped: u64 },
+    /// This bounded event subscriber fell behind.
+    ///
+    /// Consumers that maintain derived state must resynchronize.
+    Lagged {
+        /// Number of events dropped before this notification.
+        dropped: u64,
+    },
 }
 
 impl ChannelEvent {
+    /// Decodes a matching application message using an [`EventRoute`].
     pub fn route<R: EventRoute>(&self) -> Result<Option<R::Output>, PayloadError> {
         match self {
             Self::Protocol(ProtocolEvent::Message(frame)) => frame.route::<R>(),
@@ -124,29 +164,43 @@ impl ChannelEvent {
     }
 }
 
+/// Observable lifecycle state for one channel topic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelStatus {
+    /// The channel is waiting for the socket to connect.
     WaitingForSocket,
+    /// The socket is connected and the channel has not joined yet.
     WaitingToJoin,
+    /// A join request is pending.
     Joining,
+    /// The server accepted the join.
     Joined,
+    /// A leave request is pending.
     Leaving,
+    /// The channel left successfully.
     Left,
+    /// A join was rejected or the server sent `phx_error`.
     Errored,
+    /// The handle was dropped, the server closed it, or the driver stopped.
     Closed,
 }
 
+/// Correlated Phoenix reply status and response payload.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reply {
+    /// Phoenix `ok` or `error` reply status.
     pub status: ReplyStatus,
+    /// JSON or binary response payload.
     pub response: Payload,
 }
 
 impl Reply {
+    /// Deserializes the response when it is JSON, regardless of reply status.
     pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, PayloadError> {
         self.response.deserialize()
     }
 
+    /// Converts an `ok` reply to `Ok` and an `error` reply to `Err`.
     pub fn into_result(self) -> Result<Payload, Payload> {
         match self.status {
             ReplyStatus::Ok => Ok(self.response),
@@ -154,6 +208,7 @@ impl Reply {
         }
     }
 
+    /// Requires an `ok` status and deserializes its JSON response.
     pub fn deserialize_ok<T: DeserializeOwned>(self) -> Result<T, ReplyError> {
         self.into_result()
             .map_err(ReplyError::Server)?
@@ -162,30 +217,43 @@ impl Reply {
     }
 }
 
+/// Server rejection or response decoding failure.
 #[derive(Debug, Error)]
 pub enum ReplyError {
+    /// Phoenix returned an `error` reply and its payload.
     #[error("Phoenix returned an error reply: {0:?}")]
     Server(Payload),
+    /// The successful response was not valid for the requested type.
     #[error("failed to decode reply payload: {0}")]
     Decode(PayloadError),
 }
 
+/// Failure from [`Channel::call_json`].
 #[derive(Debug, Error)]
 pub enum CallJsonError {
+    /// The managed call failed.
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// The request value could not be serialized as JSON.
     #[error("failed to encode request payload: {0}")]
     Encode(serde_json::Error),
+    /// Phoenix rejected the request or the response could not be decoded.
     #[error(transparent)]
     Reply(#[from] ReplyError),
 }
 
+/// Managed operation used in timeout and interruption errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClientOperation {
+    /// Joining a channel.
     Join,
+    /// Sending a correlated channel event.
     Call,
+    /// Sending an event without waiting for a Phoenix reply.
     Cast,
+    /// Leaving a channel.
     Leave,
+    /// Sending an explicit heartbeat.
     Ping,
 }
 
@@ -201,37 +269,67 @@ impl std::fmt::Display for ClientOperation {
     }
 }
 
+/// Failure returned by the managed socket or channel API.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum ClientError {
+    /// The driver stopped and cannot accept more commands.
     #[error("the managed client driver stopped")]
     DriverStopped,
+    /// A non-blocking subscription command could not enter the bounded queue.
     #[error("the client command queue is full")]
     CommandQueueFull,
+    /// Too many calls are waiting for this topic to become joined.
     #[error("the unsent push buffer is full for topic {0}")]
     PushBufferFull(String),
+    /// A channel handle already exists for this topic.
     #[error("a channel already exists for topic {0}")]
     DuplicateChannel(String),
+    /// The requested channel is already joined or joining.
     #[error("channel {0} is already joined")]
     AlreadyJoined(String),
+    /// The channel must be joined before accepting this operation.
     #[error("channel {0} must be joined again before sending events")]
     ChannelNotJoined(String),
+    /// The operation requires an active socket connection.
     #[error("the socket must be connected for this operation")]
     SocketNotConnected,
+    /// The active transport cannot carry Phoenix binary frames.
     #[error("the active transport does not support binary Phoenix frames")]
     BinaryNotSupported,
+    /// The requested operation did not complete before its deadline.
     #[error("{operation} timed out after {timeout:?}")]
     Timeout {
+        /// Operation that timed out.
         operation: ClientOperation,
+        /// Applied timeout duration.
         timeout: Duration,
     },
+    /// A transmitted operation lost its connection before receiving a reply.
     #[error("{operation} was interrupted by connection loss")]
-    Interrupted { operation: ClientOperation },
+    Interrupted {
+        /// Interrupted operation.
+        operation: ClientOperation,
+    },
+    /// Protocol state rejected an operation or incoming frame.
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// Loading a fresh join payload failed.
     #[error("join payload loader failed for {topic}: {message}")]
-    JoinPayload { topic: String, message: String },
+    JoinPayload {
+        /// Topic whose payload could not be loaded.
+        topic: String,
+        /// Loader-provided error message.
+        message: String,
+    },
+    /// Phoenix returned an error reply to a join.
     #[error("channel join was rejected for {topic}: {response:?}")]
-    JoinRejected { topic: String, response: Payload },
+    JoinRejected {
+        /// Rejected topic.
+        topic: String,
+        /// Server rejection payload.
+        response: Payload,
+    },
+    /// No registered channel matched the topic.
     #[error("unknown channel topic: {0}")]
     UnknownTopic(String),
 }
@@ -275,66 +373,105 @@ impl<T: Copy + Eq> ObservableStatus<T> {
     }
 }
 
+/// Stream of changes to a copyable socket or channel status.
 pub struct StatusChanges<T> {
     receiver: mpsc::Receiver<()>,
     status: Rc<ObservableStatus<T>>,
 }
 
 impl<T: Copy + Eq> StatusChanges<T> {
+    /// Returns the latest status without waiting for a change.
     pub fn current(&self) -> T {
         self.status.get()
     }
 
+    /// Waits for a new status, or returns `None` after the driver closes it.
     pub async fn changed(&mut self) -> Option<T> {
         self.receiver.next().await.map(|()| self.status.get())
     }
 }
 
+/// Status-change stream for a [`Socket`].
 pub type SocketStatusChanges = StatusChanges<SocketStatus>;
+/// Status-change stream for a [`Channel`].
 pub type ChannelStatusChanges = StatusChanges<ChannelStatus>;
 
+/// Structured lifecycle and frame observation emitted by the driver.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TelemetryEvent {
+    /// A socket lifecycle event.
     Socket(SocketEvent),
+    /// A channel lifecycle or protocol event.
     Channel {
+        /// Channel topic.
         topic: String,
+        /// Event emitted for the topic.
         event: ChannelEvent,
     },
+    /// An encoded frame was sent.
     FrameSent {
+        /// Frame topic.
         topic: String,
+        /// Frame event name.
         event: String,
+        /// Whether the encoded frame was binary.
         binary: bool,
+        /// Encoded frame size in bytes.
         bytes: usize,
     },
+    /// An encoded frame was received.
     FrameReceived {
+        /// Frame topic.
         topic: String,
+        /// Frame event name.
         event: String,
+        /// Whether the encoded frame was binary.
         binary: bool,
+        /// Encoded frame size in bytes.
         bytes: usize,
     },
+    /// A transport connection attempt ended.
     ConnectionAttemptFinished {
+        /// Zero-based attempt number.
         attempt: u32,
+        /// Time spent loading configuration and connecting the transport.
         duration: Duration,
+        /// Whether the transport connected successfully.
         connected: bool,
     },
+    /// A channel call reached a terminal outcome.
     CallCompleted {
+        /// Channel topic.
         topic: String,
+        /// Application event name.
         event: String,
+        /// Reply or failure classification.
         outcome: CallOutcome,
+        /// Duration from API invocation through the terminal outcome.
         duration: Duration,
     },
 }
 
+/// Terminal outcome recorded for call telemetry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CallOutcome {
+    /// Phoenix returned a correlated reply with this status.
     Reply(ReplyStatus),
+    /// The caller cancelled or timed out before completion.
     Cancelled,
+    /// Connection loss interrupted a transmitted call.
     Interrupted,
+    /// The client rejected the call before transmission.
     Rejected,
 }
 
+/// Callback invoked synchronously for every [`TelemetryEvent`].
 pub type TelemetryHook = Rc<dyn Fn(&TelemetryEvent)>;
 
+/// Handle used to configure channels and control the managed connection.
+///
+/// The companion [`Driver`] owns all protocol and transport state and must be
+/// polled continuously.
 #[derive(Clone)]
 pub struct Socket {
     commands: mpsc::Sender<Command>,
@@ -347,6 +484,7 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Creates a socket and driver using the bounded default Phoenix v2 codec.
     pub fn new(
         connector: impl Connector + 'static,
         timer: impl Timer + 'static,
@@ -360,6 +498,7 @@ impl Socket {
         )
     }
 
+    /// Creates a socket and driver using an application-provided codec.
     pub fn new_with_codec(
         connector: impl Connector + 'static,
         timer: impl Timer + 'static,
@@ -398,6 +537,9 @@ impl Socket {
         (socket, driver)
     }
 
+    /// Registers one channel topic and its per-attempt join payload loader.
+    ///
+    /// Only one live [`Channel`] handle may exist for a topic.
     pub fn channel(
         &self,
         topic: impl Into<String>,
@@ -440,6 +582,7 @@ impl Socket {
         })
     }
 
+    /// Creates an independent bounded socket event subscriber.
     pub fn events(&self) -> Result<SocketEvents, ClientError> {
         let (events, receiver) = mpsc::channel(self.options.event_capacity);
         let mut commands = self.commands.clone();
@@ -449,14 +592,17 @@ impl Socket {
         Ok(SocketEvents { receiver })
     }
 
+    /// Returns the latest socket status.
     pub fn status(&self) -> SocketStatus {
         self.status.get()
     }
 
+    /// Creates a stream of subsequent socket status changes.
     pub fn status_changes(&self) -> SocketStatusChanges {
         self.status.subscribe()
     }
 
+    /// Enables connection attempts and waits until the command is accepted.
     pub async fn connect(&self) -> Result<(), ClientError> {
         let (response, receiver) = oneshot::channel();
         let mut commands = self.commands.clone();
@@ -467,10 +613,12 @@ impl Socket {
         receiver.await.map_err(|_| ClientError::DriverStopped)
     }
 
+    /// Disables automatic reconnection and closes the active transport.
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         self.disconnect_inner(None).await
     }
 
+    /// Disconnects with an explicit WebSocket close code and reason.
     pub async fn disconnect_with(
         &self,
         code: u16,
@@ -493,15 +641,18 @@ impl Socket {
         receiver.await.map_err(|_| ClientError::DriverStopped)
     }
 
+    /// Disconnects and immediately enables a new connection cycle.
     pub async fn reconnect(&self) -> Result<(), ClientError> {
         self.disconnect().await?;
         self.connect().await
     }
 
+    /// Sends a heartbeat using the default call timeout and returns its RTT.
     pub async fn ping(&self) -> Result<Duration, ClientError> {
         self.ping_with_timeout(self.options.call_timeout).await
     }
 
+    /// Sends a heartbeat with an explicit timeout and returns its RTT.
     pub async fn ping_with_timeout(&self, timeout: Duration) -> Result<Duration, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -539,6 +690,7 @@ impl Socket {
         id
     }
 
+    /// Permanently stops the driver and closes the active transport.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         let (response, receiver) = oneshot::channel();
         let mut commands = self.commands.clone();
@@ -550,16 +702,21 @@ impl Socket {
     }
 }
 
+/// Independent bounded stream of [`SocketEvent`] values.
 pub struct SocketEvents {
     receiver: mpsc::Receiver<SocketEvent>,
 }
 
 impl SocketEvents {
+    /// Returns the next socket event or `None` after the driver stops.
     pub async fn next(&mut self) -> Option<SocketEvent> {
         self.receiver.next().await
     }
 }
 
+/// Handle for one Phoenix channel topic.
+///
+/// Dropping the handle unregisters the topic and its pending operations.
 pub struct Channel {
     topic: String,
     commands: mpsc::Sender<Command>,
@@ -581,22 +738,27 @@ struct OperationTimeouts {
 }
 
 impl Channel {
+    /// Returns the registered channel topic.
     pub fn topic(&self) -> &str {
         &self.topic
     }
 
+    /// Returns the latest channel status.
     pub fn status(&self) -> ChannelStatus {
         self.status.get()
     }
 
+    /// Creates a stream of subsequent channel status changes.
     pub fn status_changes(&self) -> ChannelStatusChanges {
         self.status.subscribe()
     }
 
+    /// Joins using the default join timeout and a freshly loaded payload.
     pub async fn join(&self) -> Result<Payload, ClientError> {
         self.join_with_timeout(self.timeouts.join).await
     }
 
+    /// Joins with an explicit timeout and a freshly loaded payload.
     pub async fn join_with_timeout(&self, timeout: Duration) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -611,6 +773,7 @@ impl Channel {
             .await
     }
 
+    /// Sends an event and waits for its correlated reply.
     pub async fn call(
         &self,
         event: impl Into<String>,
@@ -620,6 +783,7 @@ impl Channel {
             .await
     }
 
+    /// Sends an event and waits up to `timeout` for its correlated reply.
     pub async fn call_with_timeout(
         &self,
         event: impl Into<String>,
@@ -641,6 +805,7 @@ impl Channel {
             .await
     }
 
+    /// Serializes a JSON request, requires an `ok` reply, and decodes its response.
     pub async fn call_json<Request, Response>(
         &self,
         event: impl Into<String>,
@@ -667,6 +832,8 @@ impl Channel {
             .await
     }
 
+    /// Sends an event without asking Phoenix for a reply, waiting at most `timeout`
+    /// for the frame to be accepted by the transport.
     pub async fn cast_with_timeout(
         &self,
         event: impl Into<String>,
@@ -687,10 +854,12 @@ impl Channel {
             .await
     }
 
+    /// Leaves using the default leave timeout.
     pub async fn leave(&self) -> Result<Payload, ClientError> {
         self.leave_with_timeout(self.timeouts.leave).await
     }
 
+    /// Leaves and waits up to `timeout` for the server reply.
     pub async fn leave_with_timeout(&self, timeout: Duration) -> Result<Payload, ClientError> {
         let id = self.next_request_id();
         let (response, receiver) = oneshot::channel();
@@ -705,10 +874,12 @@ impl Channel {
             .await
     }
 
+    /// Returns the next event from this handle's original event stream.
     pub async fn next_event(&mut self) -> Option<ChannelEvent> {
         self.events.next().await
     }
 
+    /// Creates an independent bounded channel event subscriber.
     pub fn events(&self) -> Result<ChannelEvents, ClientError> {
         let (events, receiver) = mpsc::channel(self.event_capacity);
         let mut commands = self.commands.clone();
@@ -721,6 +892,7 @@ impl Channel {
         Ok(ChannelEvents { receiver })
     }
 
+    /// Subscribes to application messages with one event name.
     pub fn subscribe(&self, event: impl Into<String>) -> Result<EventSubscription, ClientError> {
         Ok(EventSubscription {
             event: event.into(),
@@ -728,6 +900,7 @@ impl Channel {
         })
     }
 
+    /// Creates a synchronized Phoenix Presence consumer for this channel.
     pub fn presence(&self) -> Result<ChannelPresence<'_>, ClientError> {
         ChannelPresence::new(self)
     }
@@ -777,29 +950,44 @@ impl Channel {
     }
 }
 
+/// Independent bounded stream of [`ChannelEvent`] values.
 pub struct ChannelEvents {
     receiver: mpsc::Receiver<ChannelEvent>,
 }
 
+/// Event returned by an application-event subscription.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SubscriptionEvent {
+    /// A matching application message.
     Message(Payload),
+    /// The underlying socket disconnected.
     Disconnected,
+    /// The server sent `phx_error` for the channel.
     ChannelError(Payload),
+    /// The server sent `phx_close` for the channel.
     ChannelClosed(Payload),
-    Lagged { dropped: u64 },
+    /// The bounded event stream dropped messages.
+    ///
+    /// `dropped` is the number discarded before this notification.
+    Lagged {
+        /// Number of events dropped before this notification.
+        dropped: u64,
+    },
 }
 
+/// Filtered bounded subscription for one application event name.
 pub struct EventSubscription {
     event: String,
     events: ChannelEvents,
 }
 
 impl EventSubscription {
+    /// Returns the event name matched by this subscription.
     pub fn event(&self) -> &str {
         &self.event
     }
 
+    /// Returns the next matching message or channel lifecycle event.
     pub async fn next(&mut self) -> Option<SubscriptionEvent> {
         loop {
             match self.events.next().await? {
@@ -825,6 +1013,7 @@ impl EventSubscription {
 }
 
 impl ChannelEvents {
+    /// Returns the next channel event or `None` after the driver stops.
     pub async fn next(&mut self) -> Option<ChannelEvent> {
         self.receiver.next().await
     }

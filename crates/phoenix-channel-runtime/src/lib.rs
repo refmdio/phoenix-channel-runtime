@@ -1,10 +1,7 @@
-//! Runtime-independent building blocks for Phoenix Channels clients.
-//!
-//! This crate owns the Phoenix Channels v2 wire format and protocol state. It
-//! deliberately does not choose a WebSocket implementation, async executor,
-//! timer, authentication scheme, or UI framework.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 
 mod codec;
 mod frame;

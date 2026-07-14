@@ -9,14 +9,20 @@ use crate::{EventRoute, Payload, PayloadError};
 /// `[join_ref, ref, topic, event, payload]`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
+    /// Reference of the channel join generation, when present.
     pub join_ref: Option<String>,
+    /// Reference used to correlate a push and reply, when present.
     pub reference: Option<String>,
+    /// Channel topic or the special `phoenix` heartbeat topic.
     pub topic: String,
+    /// Phoenix or application-defined event name.
     pub event: String,
+    /// JSON, binary, or reply payload carried by the frame.
     pub payload: Payload,
 }
 
 impl Frame {
+    /// Creates a protocol frame from its v2 serializer fields.
     pub fn new(
         join_ref: Option<String>,
         reference: Option<String>,
@@ -33,6 +39,9 @@ impl Frame {
         }
     }
 
+    /// Encodes this frame using Phoenix's JSON v2 representation.
+    ///
+    /// Binary payloads must be encoded with [`crate::Codec`] instead.
     pub fn encode_text(&self) -> Result<String, FrameCodecError> {
         serde_json::to_string(&(
             &self.join_ref,
@@ -46,6 +55,7 @@ impl Frame {
         .map_err(FrameCodecError::Encode)
     }
 
+    /// Decodes a Phoenix JSON v2 frame.
     pub fn decode_text(input: &str) -> Result<Self, FrameCodecError> {
         let values: Vec<Value> = serde_json::from_str(input).map_err(FrameCodecError::Decode)?;
         if values.len() != 5 {
@@ -72,6 +82,9 @@ impl Frame {
         })
     }
 
+    /// Decodes this frame's JSON payload when its event matches `R::EVENT`.
+    ///
+    /// Returns `Ok(None)` for a different event.
     pub fn route<R: EventRoute>(&self) -> Result<Option<R::Output>, PayloadError> {
         if self.event == R::EVENT {
             self.payload.deserialize().map(Some)
@@ -90,16 +103,22 @@ fn decode_reference(value: &Value, field: &'static str) -> Result<Option<String>
     }
 }
 
+/// Failure while encoding or decoding a Phoenix JSON v2 frame.
 #[derive(Debug, Error)]
 pub enum FrameCodecError {
+    /// The JSON text could not be decoded.
     #[error("failed to decode a Phoenix frame: {0}")]
     Decode(#[source] serde_json::Error),
+    /// The frame could not be serialized as JSON.
     #[error("failed to encode a Phoenix frame: {0}")]
     Encode(#[source] serde_json::Error),
+    /// The JSON array did not contain exactly five fields.
     #[error("Phoenix v2 frame must contain five values, received {0}")]
     InvalidLength(usize),
+    /// A serializer field had the wrong JSON type.
     #[error("Phoenix frame contains an invalid {0} field")]
     InvalidField(&'static str),
+    /// A binary payload was passed to the JSON text encoder.
     #[error("binary payloads require a binary Phoenix frame")]
     BinaryPayloadRequiresBinaryFrame,
 }

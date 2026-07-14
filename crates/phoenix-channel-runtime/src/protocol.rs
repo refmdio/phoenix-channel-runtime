@@ -7,71 +7,119 @@ use crate::{Frame, Payload};
 
 const PHOENIX_TOPIC: &str = "phoenix";
 
+/// Local lifecycle state for a channel topic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelState {
+    /// A `phx_join` reply is pending.
     Joining,
+    /// The server accepted the join.
     Joined,
+    /// A `phx_leave` reply is pending.
     Leaving,
+    /// The server closed the channel.
     Closed,
+    /// The server reported a channel error.
     Errored,
+    /// The transport disconnected while the channel was active.
     Disconnected,
 }
 
+/// Status carried by a Phoenix `phx_reply`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyStatus {
+    /// The server accepted the operation.
     Ok,
+    /// The server rejected the operation.
     Error,
 }
 
+/// An outbound frame and the reference allocated to correlate its reply.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Outbound {
+    /// Unique request reference.
     pub reference: String,
+    /// Frame to encode and send.
     pub frame: Frame,
 }
 
+/// Semantic event produced from an incoming Phoenix frame or connection reset.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolEvent {
+    /// A topic join succeeded.
     Joined {
+        /// Joined topic.
         topic: String,
+        /// Correlated request reference.
         reference: String,
+        /// Server join response.
         response: Payload,
     },
+    /// A topic join was rejected.
     JoinError {
+        /// Rejected topic.
         topic: String,
+        /// Correlated request reference.
         reference: String,
+        /// Server error response.
         response: Payload,
     },
+    /// A topic leave completed.
     Left {
+        /// Left topic.
         topic: String,
+        /// Correlated request reference.
         reference: String,
+        /// Server leave response.
         response: Payload,
     },
+    /// An application push received a reply.
     Reply {
+        /// Topic to which the push was sent.
         topic: String,
+        /// Application event name.
         event: String,
+        /// Correlated request reference.
         reference: String,
+        /// Phoenix reply status.
         status: ReplyStatus,
+        /// Server response payload.
         response: Payload,
     },
+    /// An application or Presence message that was not a correlated reply.
     Message(Frame),
+    /// The server sent `phx_close` for a topic.
     ChannelClosed {
+        /// Closed topic.
         topic: String,
+        /// Close payload.
         payload: Payload,
     },
+    /// The server sent `phx_error` for a topic.
     ChannelError {
+        /// Errored topic.
         topic: String,
+        /// Error payload.
         payload: Payload,
     },
+    /// The server acknowledged a heartbeat.
     HeartbeatAck {
+        /// Correlated heartbeat reference.
         reference: String,
+        /// Heartbeat reply status.
         status: ReplyStatus,
     },
+    /// A pending request was interrupted by transport reset.
     RequestInterrupted {
+        /// Topic on which the request was active.
         topic: String,
+        /// Join, leave, or application event name.
         event: String,
+        /// Interrupted request reference.
         reference: String,
     },
+    /// A frame belonged to an earlier join generation.
     StaleMessage(Frame),
+    /// A reply had no matching pending operation.
     UnmatchedReply(Frame),
 }
 
@@ -103,14 +151,20 @@ pub struct Protocol {
 }
 
 impl Protocol {
+    /// Creates empty protocol state.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Returns the local state of `topic`, if it is known.
     pub fn channel_state(&self, topic: &str) -> Option<ChannelState> {
         self.channels.get(topic).map(|channel| channel.state)
     }
 
+    /// Starts joining a topic with the supplied parameters.
+    ///
+    /// The returned frame must be sent and later passed back through
+    /// [`Protocol::receive`] when its reply arrives.
     pub fn join(
         &mut self,
         topic: impl Into<String>,
@@ -154,6 +208,7 @@ impl Protocol {
         })
     }
 
+    /// Starts a new join generation for a disconnected, errored, or closed topic.
     pub fn rejoin(
         &mut self,
         topic: impl Into<String>,
@@ -170,6 +225,7 @@ impl Protocol {
         }
     }
 
+    /// Rejoins every inactive topic using the parameters stored by its prior join.
     pub fn rejoin_all_with_stored_params(&mut self) -> Vec<Outbound> {
         let channels = self
             .channels
@@ -189,6 +245,7 @@ impl Protocol {
             .collect()
     }
 
+    /// Starts leaving a joined topic.
     pub fn leave(&mut self, topic: &str) -> Result<Outbound, ProtocolError> {
         let reference = self.allocate_reference();
         let channel = self
@@ -220,6 +277,7 @@ impl Protocol {
         })
     }
 
+    /// Builds and tracks an application push that expects a reply.
     pub fn push(
         &mut self,
         topic: &str,
@@ -319,6 +377,7 @@ impl Protocol {
         removed
     }
 
+    /// Builds and tracks a Phoenix heartbeat.
     pub fn heartbeat(&mut self) -> Outbound {
         let reference = self.allocate_reference();
         self.pending.insert(reference.clone(), Pending::Heartbeat);
@@ -334,6 +393,7 @@ impl Protocol {
         }
     }
 
+    /// Applies an incoming frame and returns its semantic protocol event.
     pub fn receive(&mut self, frame: Frame) -> Result<ProtocolEvent, ProtocolError> {
         if self.channels.get(&frame.topic).is_some_and(|channel| {
             frame.join_ref.is_some() && frame.join_ref.as_deref() != Some(channel.join_ref.as_str())
@@ -368,6 +428,7 @@ impl Protocol {
         }
     }
 
+    /// Marks active channels disconnected and returns interrupted requests.
     pub fn reset_connection(&mut self) -> Vec<ProtocolEvent> {
         let interrupted = self
             .pending
@@ -481,16 +542,22 @@ fn decode_reply_status(status: Option<&str>) -> Result<ReplyStatus, ProtocolErro
     }
 }
 
+/// Invalid operation or reply for the current protocol state.
 #[derive(Debug, Error, PartialEq)]
 pub enum ProtocolError {
+    /// A join was requested for a topic that is already active.
     #[error("topic is already active: {0}")]
     AlreadyActive(String),
+    /// An operation required a joined topic.
     #[error("topic is not joined: {0}")]
     NotJoined(String),
+    /// An operation referred to a topic absent from protocol state.
     #[error("unknown topic: {0}")]
     UnknownTopic(String),
+    /// A `phx_reply` payload did not have the expected reply envelope.
     #[error("phx_reply payload must be an object")]
     InvalidReplyPayload,
+    /// A `phx_reply` status was neither `ok` nor `error`.
     #[error("phx_reply status must be ok or error")]
     InvalidReplyStatus,
 }

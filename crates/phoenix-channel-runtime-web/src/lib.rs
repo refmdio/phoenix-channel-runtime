@@ -1,6 +1,7 @@
-//! Browser WebSocket transport for `wasm32-unknown-unknown`.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 
 #[cfg(target_arch = "wasm32")]
 mod web {
@@ -35,11 +36,13 @@ mod web {
     const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(20);
     const HEALTH_CHECK_REFERENCE: &str = "phoenix-channel-runtime-health";
 
+    /// Browser WebSocket transport implementing the runtime-neutral transport API.
     pub struct WebTransport {
         inner: Option<WebSocket>,
         queued: VecDeque<TransportEvent>,
     }
 
+    /// Phoenix LongPoll transport for browsers without a usable WebSocket path.
     pub struct LongPollTransport {
         endpoint: url::Url,
         token: Rc<RefCell<Option<String>>>,
@@ -51,6 +54,10 @@ mod web {
         next_request_id: Rc<Cell<u64>>,
     }
 
+    /// Browser page and network lifecycle listeners for a managed socket.
+    ///
+    /// Keep this value alive while the socket is active. Dropping it removes
+    /// all installed event listeners.
     pub struct WebLifecycle {
         window: Window,
         pagehide: Closure<dyn FnMut(Event)>,
@@ -61,6 +68,7 @@ mod web {
     }
 
     impl WebLifecycle {
+        /// Attaches page hide/show, visibility, offline, and online listeners.
         pub fn attach(socket: Socket) -> Result<Self, JsValue> {
             let window =
                 web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
@@ -178,6 +186,7 @@ mod web {
         let _ = window.remove_event_listener_with_callback(name, callback.as_ref().unchecked_ref());
     }
 
+    /// Browser connector with optional Phoenix LongPoll fallback.
     #[derive(Clone)]
     pub struct WebConnector {
         endpoint: WebEndpoint,
@@ -185,6 +194,7 @@ mod web {
         long_poll_timeout: Duration,
     }
 
+    /// Browser connector that always uses Phoenix LongPoll.
     #[derive(Clone)]
     pub struct LongPollConnector {
         endpoint: WebEndpoint,
@@ -198,6 +208,7 @@ mod web {
     }
 
     impl WebConnector {
+        /// Creates a connector for an already-resolved WebSocket URL.
         pub fn new(url: impl Into<String>) -> Self {
             Self {
                 endpoint: WebEndpoint::Url(url.into()),
@@ -206,6 +217,7 @@ mod web {
             }
         }
 
+        /// Creates a connector that resolves a Phoenix endpoint each attempt.
         pub fn from_endpoint(endpoint: Endpoint) -> Self {
             Self {
                 endpoint: WebEndpoint::Phoenix(endpoint),
@@ -214,11 +226,13 @@ mod web {
             }
         }
 
+        /// Enables LongPoll fallback after this WebSocket open or health deadline.
         pub fn long_poll_fallback(mut self, after: Duration) -> Self {
             self.long_poll_fallback = Some(after);
             self
         }
 
+        /// Sets the timeout applied to each fallback LongPoll request.
         pub fn long_poll_timeout(mut self, timeout: Duration) -> Self {
             self.long_poll_timeout = timeout;
             self
@@ -226,6 +240,7 @@ mod web {
     }
 
     impl LongPollConnector {
+        /// Creates a LongPoll connector from an already-resolved endpoint URL.
         pub fn new(url: impl Into<String>) -> Self {
             Self {
                 endpoint: WebEndpoint::Url(url.into()),
@@ -233,6 +248,7 @@ mod web {
             }
         }
 
+        /// Creates a LongPoll connector that resolves a Phoenix endpoint each attempt.
         pub fn from_endpoint(endpoint: Endpoint) -> Self {
             Self {
                 endpoint: WebEndpoint::Phoenix(endpoint),
@@ -240,6 +256,7 @@ mod web {
             }
         }
 
+        /// Sets the timeout applied to every LongPoll request.
         pub fn request_timeout(mut self, timeout: Duration) -> Self {
             self.request_timeout = timeout;
             self
@@ -306,6 +323,7 @@ mod web {
         }
     }
 
+    /// Browser timer backed by `setTimeout` and the Performance API.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct WebTimer;
 
@@ -324,6 +342,7 @@ mod web {
     }
 
     impl WebTransport {
+        /// Opens an already-resolved browser WebSocket URL.
         pub fn connect(url: &str) -> Result<Self, TransportError> {
             let inner = WebSocket::open(url).map_err(|error| {
                 TransportError::with_kind(TransportErrorKind::Connect, format!("{error:?}"))

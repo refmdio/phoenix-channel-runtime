@@ -22,10 +22,12 @@ pub struct Session<T> {
 }
 
 impl<T: Transport> Session<T> {
+    /// Creates a session using the bounded default Phoenix v2 codec.
     pub fn new(transport: T) -> Self {
         Self::with_codec(transport, PhoenixV2Codec::limited(Default::default()))
     }
 
+    /// Creates a session with an application-provided codec.
     pub fn with_codec(transport: T, codec: impl Codec + 'static) -> Self {
         Self {
             protocol: Protocol::new(),
@@ -35,22 +37,27 @@ impl<T: Transport> Session<T> {
         }
     }
 
+    /// Borrows the session's protocol state.
     pub fn protocol(&self) -> &Protocol {
         &self.protocol
     }
 
+    /// Mutably borrows the session's protocol state.
     pub fn protocol_mut(&mut self) -> &mut Protocol {
         &mut self.protocol
     }
 
+    /// Mutably borrows the underlying transport.
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
     }
 
+    /// Consumes the session and returns its protocol and transport.
     pub fn into_parts(self) -> (Protocol, T) {
         (self.protocol, self.transport)
     }
 
+    /// Sends a join and waits for its correlated reply.
     pub async fn join(
         &mut self,
         topic: impl Into<String>,
@@ -62,6 +69,7 @@ impl<T: Transport> Session<T> {
         self.wait_for_reference(&reference).await
     }
 
+    /// Sends a rejoin with refreshed parameters and waits for its reply.
     pub async fn rejoin(
         &mut self,
         topic: impl Into<String>,
@@ -73,6 +81,7 @@ impl<T: Transport> Session<T> {
         self.wait_for_reference(&reference).await
     }
 
+    /// Sends an application event and waits for its correlated reply.
     pub async fn push(
         &mut self,
         topic: &str,
@@ -85,6 +94,7 @@ impl<T: Transport> Session<T> {
         self.wait_for_reference(&reference).await
     }
 
+    /// Leaves a joined topic and waits for its reply.
     pub async fn leave(&mut self, topic: &str) -> Result<ProtocolEvent, SessionError> {
         let outbound = self.protocol.leave(topic)?;
         let reference = outbound.reference.clone();
@@ -92,6 +102,7 @@ impl<T: Transport> Session<T> {
         self.wait_for_reference(&reference).await
     }
 
+    /// Sends a Phoenix heartbeat and waits for its acknowledgement.
     pub async fn heartbeat(&mut self) -> Result<ProtocolEvent, SessionError> {
         let outbound = self.protocol.heartbeat();
         let reference = outbound.reference.clone();
@@ -99,6 +110,7 @@ impl<T: Transport> Session<T> {
         self.wait_for_reference(&reference).await
     }
 
+    /// Returns the next buffered or transport event.
     pub async fn next_event(&mut self) -> Result<ProtocolEvent, SessionError> {
         if let Some(event) = self.buffered_events.pop_front() {
             return Ok(event);
@@ -113,6 +125,7 @@ impl<T: Transport> Session<T> {
         self.protocol.reset_connection()
     }
 
+    /// Closes the underlying transport.
     pub async fn close(&mut self) -> Result<(), SessionError> {
         self.transport.close().await?;
         Ok(())
@@ -161,14 +174,19 @@ fn event_reference(event: &ProtocolEvent) -> Option<&str> {
     }
 }
 
+/// Protocol, codec, or transport failure produced by a [`Session`].
 #[derive(Debug, Error)]
 pub enum SessionError {
+    /// Protocol state rejected an operation or incoming reply.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    /// A frame could not be encoded or decoded.
     #[error(transparent)]
     Codec(#[from] CodecError),
+    /// The underlying transport operation failed.
     #[error(transparent)]
     Transport(#[from] TransportError),
+    /// The transport closed while the session was waiting for an event.
     #[error("WebSocket connection closed: {0:?}")]
     ConnectionClosed(crate::TransportClose),
 }

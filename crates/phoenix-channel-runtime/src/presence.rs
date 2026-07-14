@@ -5,10 +5,12 @@ use thiserror::Error;
 
 use crate::Frame;
 
+/// Current Phoenix Presence entries keyed by application-defined presence key.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PresenceState(pub BTreeMap<String, Presence>);
 
 impl PresenceState {
+    /// Decodes a `presence_state` JSON object.
     pub fn from_value(value: &Value) -> Result<Self, PresenceError> {
         let state = value.as_object().ok_or(PresenceError::InvalidState)?;
         state
@@ -18,22 +20,28 @@ impl PresenceState {
             .map(Self)
     }
 
+    /// Returns the Presence entry for `key`.
     pub fn get(&self, key: &str) -> Option<&Presence> {
         self.0.get(key)
     }
 
+    /// Iterates over presence keys and entries in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Presence)> {
         self.0.iter().map(|(key, value)| (key.as_str(), value))
     }
 
+    /// Returns whether the state contains no presence entries.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 }
 
+/// A Presence entry and its active connection metadata.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Presence {
+    /// Active metas, each identified by its `phx_ref` field.
     pub metas: Vec<Map<String, Value>>,
+    /// Additional fields attached to the presence entry outside `metas`.
     pub fields: Map<String, Value>,
 }
 
@@ -61,13 +69,17 @@ impl Presence {
     }
 }
 
+/// Presence joins and leaves produced by a state or diff synchronization.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PresenceDiff {
+    /// Entries or metas that joined.
     pub joins: PresenceState,
+    /// Entries or metas that left.
     pub leaves: PresenceState,
 }
 
 impl PresenceDiff {
+    /// Decodes a `presence_diff` JSON object.
     pub fn from_value(value: &Value) -> Result<Self, PresenceError> {
         let diff = value.as_object().ok_or(PresenceError::InvalidDiff)?;
         let joins = diff.get("joins").ok_or(PresenceError::InvalidDiff)?;
@@ -94,13 +106,18 @@ fn extend_state(target: &mut PresenceState, source: PresenceState) {
     }
 }
 
+/// Result of applying a frame to a [`PresenceTracker`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum PresenceUpdate {
+    /// The frame was not a configured Presence event.
     Ignored,
+    /// A diff was queued until a matching full state arrives.
     Pending,
+    /// State was updated with the returned joins and leaves.
     Synced(PresenceDiff),
 }
 
+/// Applies Phoenix Presence state and diff frames in join-generation order.
 #[derive(Clone, Debug)]
 pub struct PresenceTracker {
     state: PresenceState,
@@ -111,6 +128,7 @@ pub struct PresenceTracker {
 }
 
 impl PresenceTracker {
+    /// Creates a tracker for `presence_state` and `presence_diff` events.
     pub fn new() -> Self {
         Self {
             state: PresenceState::default(),
@@ -121,6 +139,7 @@ impl PresenceTracker {
         }
     }
 
+    /// Creates a tracker with application-specific state and diff event names.
     pub fn with_events(state_event: impl Into<String>, diff_event: impl Into<String>) -> Self {
         Self {
             state: PresenceState::default(),
@@ -131,16 +150,19 @@ impl PresenceTracker {
         }
     }
 
+    /// Returns the current synchronized state.
     pub fn state(&self) -> &PresenceState {
         &self.state
     }
 
+    /// Clears state, join generation, and queued diffs.
     pub fn reset(&mut self) {
         self.state = PresenceState::default();
         self.join_ref = None;
         self.pending_diffs.clear();
     }
 
+    /// Applies a Phoenix frame and returns its Presence effect.
     pub fn apply(&mut self, frame: &Frame) -> Result<PresenceUpdate, PresenceError> {
         if frame.event != self.state_event && frame.event != self.diff_event {
             return Ok(PresenceUpdate::Ignored);
@@ -177,6 +199,7 @@ impl Default for PresenceTracker {
     }
 }
 
+/// Replaces `state` with a full server state and returns its joins and leaves.
 pub fn sync_state(
     state: &mut PresenceState,
     new_state: PresenceState,
@@ -223,6 +246,7 @@ pub fn sync_state(
     Ok(changes)
 }
 
+/// Applies incremental Presence joins and leaves to `state`.
 pub fn sync_diff(
     state: &mut PresenceState,
     diff: PresenceDiff,
@@ -269,20 +293,28 @@ fn meta_ref<'a>(key: &str, meta: &'a Map<String, Value>) -> Result<&'a str, Pres
         .ok_or_else(|| PresenceError::MissingReference(key.to_owned()))
 }
 
+/// Invalid Phoenix Presence state, diff, or metadata.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PresenceError {
+    /// A full state was not a JSON object.
     #[error("presence state must be an object")]
     InvalidState,
+    /// A diff did not contain valid `joins` and `leaves` objects.
     #[error("presence diff must contain joins and leaves objects")]
     InvalidDiff,
+    /// The named presence entry was not an object.
     #[error("presence entry for {0} must be an object")]
     InvalidPresence(String),
+    /// The named presence entry had no `metas` array.
     #[error("presence entry for {0} must contain a metas array")]
     InvalidMetas(String),
+    /// A meta belonging to the named entry was not an object.
     #[error("presence meta for {0} must be an object")]
     InvalidMeta(String),
+    /// A meta belonging to the named entry had no string `phx_ref`.
     #[error("presence meta for {0} must contain a string phx_ref")]
     MissingReference(String),
+    /// Presence events cannot be decoded from binary payloads.
     #[error("presence events cannot use binary payloads")]
     BinaryPayload,
 }

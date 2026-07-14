@@ -28,16 +28,21 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{NativeConnector, NativeTimer, NativeTransportOptions};
 
+/// Thread-safe async callback that refreshes connection configuration.
 pub type NativeConnectionConfigLoader = Arc<
     dyn Fn(ConnectContext) -> BoxFuture<'static, Result<ConnectionConfig, String>> + Send + Sync,
 >;
 
+/// Thread-safe async callback that refreshes a channel join payload.
 pub type NativeJoinPayloadLoader =
     Arc<dyn Fn(JoinContext) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
+/// Thread-safe callback for managed-client telemetry.
 pub type NativeTelemetryHook = Arc<dyn Fn(&TelemetryEvent) + Send + Sync>;
+/// Thread-safe callback that decides whether and when to reconnect.
 pub type NativeReconnectPolicy = Arc<dyn Fn(ReconnectContext) -> ReconnectAction + Send + Sync>;
 
+/// Creates a native loader that clones the same connection configuration.
 pub fn native_static_connection_config(config: ConnectionConfig) -> NativeConnectionConfigLoader {
     Arc::new(move |_| {
         let config = config.clone();
@@ -45,6 +50,7 @@ pub fn native_static_connection_config(config: ConnectionConfig) -> NativeConnec
     })
 }
 
+/// Creates a native loader that clones the same join payload.
 pub fn native_static_join_payload(payload: Value) -> NativeJoinPayloadLoader {
     Arc::new(move |_| {
         let payload = payload.clone();
@@ -52,6 +58,7 @@ pub fn native_static_join_payload(payload: Value) -> NativeJoinPayloadLoader {
     })
 }
 
+/// Settings for a dedicated native client worker.
 #[derive(Clone)]
 pub struct NativeOptions {
     heartbeat_interval: Duration,
@@ -99,21 +106,25 @@ impl Default for NativeOptions {
 }
 
 impl NativeOptions {
+    /// Sets the automatic heartbeat interval.
     pub fn heartbeat_interval(mut self, value: Duration) -> Self {
         self.heartbeat_interval = value;
         self
     }
 
+    /// Sets the automatic heartbeat acknowledgement timeout.
     pub fn heartbeat_timeout(mut self, value: Duration) -> Self {
         self.heartbeat_timeout = value;
         self
     }
 
+    /// Sets the maximum duration of a transport connection attempt.
     pub fn connect_timeout(mut self, value: Duration) -> Self {
         self.connect_timeout = value;
         self
     }
 
+    /// Sets join, call, and leave timeouts to one common value.
     pub fn request_timeout(mut self, value: Duration) -> Self {
         self.join_timeout = value;
         self.call_timeout = value;
@@ -121,56 +132,67 @@ impl NativeOptions {
         self
     }
 
+    /// Sets the default join timeout.
     pub fn join_timeout(mut self, value: Duration) -> Self {
         self.join_timeout = value;
         self
     }
 
+    /// Sets the default call timeout.
     pub fn call_timeout(mut self, value: Duration) -> Self {
         self.call_timeout = value;
         self
     }
 
+    /// Sets the default leave timeout.
     pub fn leave_timeout(mut self, value: Duration) -> Self {
         self.leave_timeout = value;
         self
     }
 
+    /// Sets reconnect delays by attempt, retaining the final delay thereafter.
     pub fn reconnect_delays(mut self, values: impl IntoIterator<Item = Duration>) -> Self {
         self.reconnect_delays = normalized_delays(values);
         self
     }
 
+    /// Sets rejoin delays by attempt, retaining the final delay thereafter.
     pub fn rejoin_delays(mut self, values: impl IntoIterator<Item = Duration>) -> Self {
         self.rejoin_delays = normalized_delays(values);
         self
     }
 
+    /// Sets the bounded host-to-worker command capacity.
     pub fn command_capacity(mut self, value: usize) -> Self {
         self.command_capacity = value.max(1);
         self
     }
 
+    /// Sets how many calls may wait for a connection or join.
     pub fn push_buffer_capacity(mut self, value: usize) -> Self {
         self.push_buffer_capacity = value;
         self
     }
 
+    /// Sets each broadcast event channel's capacity.
     pub fn event_capacity(mut self, value: usize) -> Self {
         self.event_capacity = value.max(1);
         self
     }
 
+    /// Installs a thread-safe telemetry callback.
     pub fn telemetry(mut self, hook: NativeTelemetryHook) -> Self {
         self.telemetry = Some(hook);
         self
     }
 
+    /// Installs a thread-safe reconnect policy.
     pub fn reconnect_policy(mut self, policy: NativeReconnectPolicy) -> Self {
         self.reconnect_policy = Some(policy);
         self
     }
 
+    /// Replaces native WebSocket transport settings.
     pub fn transport(mut self, options: NativeTransportOptions) -> Self {
         self.transport = options;
         self
@@ -221,43 +243,61 @@ fn retry_delay(delays: &[Duration], attempt: u32) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// Failure from the native worker or managed client.
 #[derive(Debug, Error)]
 pub enum NativeRuntimeError {
+    /// The Phoenix endpoint was invalid.
     #[error(transparent)]
     Endpoint(#[from] EndpointError),
+    /// The managed client rejected or failed an operation.
     #[error(transparent)]
     Client(#[from] ClientError),
+    /// The dedicated worker thread or runtime could not start.
     #[error("failed to start native client worker: {0}")]
     WorkerStart(String),
+    /// The worker stopped before completing a host request.
     #[error("native client worker stopped")]
     WorkerStopped,
+    /// The worker terminated with the supplied failure message.
     #[error("native client worker failed: {0}")]
     WorkerFailed(String),
+    /// Joining the worker thread failed.
     #[error("failed to join native client worker: {0}")]
     WorkerJoin(String),
 }
 
+/// Failure from [`NativeChannel::call_json`].
 #[derive(Debug, Error)]
 pub enum NativeCallJsonError {
+    /// The native worker or managed call failed.
     #[error(transparent)]
     Runtime(#[from] NativeRuntimeError),
+    /// The request could not be serialized as JSON.
     #[error("failed to encode request payload: {0}")]
     Encode(serde_json::Error),
+    /// Phoenix rejected the call or its response could not be decoded.
     #[error(transparent)]
     Reply(#[from] phoenix_channel_client::ReplyError),
 }
 
+/// Lifecycle state of the dedicated native worker thread.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeWorkerStatus {
+    /// The worker is accepting and processing commands.
     Running,
+    /// The worker shut down normally.
     Stopped,
+    /// The worker terminated with an error or panic message.
     Failed(String),
 }
 
+/// Failure while consuming a native broadcast or status stream.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum NativeEventError {
+    /// The bounded broadcast receiver missed this many messages.
     #[error("event receiver lagged by {0} messages")]
     Lagged(u64),
+    /// All senders for the event or status stream were dropped.
     #[error("event stream closed")]
     Closed,
 }
@@ -315,6 +355,7 @@ impl Drop for WorkerOwner {
     }
 }
 
+/// `Send + Sync` handle for a managed client running on a dedicated thread.
 #[derive(Clone)]
 pub struct NativeSocket {
     owner: Arc<WorkerOwner>,
@@ -323,6 +364,7 @@ pub struct NativeSocket {
 }
 
 impl NativeSocket {
+    /// Starts a worker with static connection configuration and default options.
     pub fn spawn(
         endpoint: impl Into<String>,
         config: ConnectionConfig,
@@ -334,6 +376,7 @@ impl NativeSocket {
         )
     }
 
+    /// Starts a worker with static connection configuration and custom options.
     pub fn spawn_with_options(
         endpoint: impl Into<String>,
         config: ConnectionConfig,
@@ -342,6 +385,7 @@ impl NativeSocket {
         Self::spawn_with_loader(endpoint, native_static_connection_config(config), options)
     }
 
+    /// Starts a worker with per-attempt connection configuration.
     pub fn spawn_with_loader(
         endpoint: impl Into<String>,
         config_loader: NativeConnectionConfigLoader,
@@ -413,32 +457,38 @@ impl NativeSocket {
         })
     }
 
+    /// Returns the latest managed socket status.
     pub fn status(&self) -> SocketStatus {
         *self.status.borrow()
     }
 
+    /// Creates an independent bounded socket event receiver.
     pub fn events(&self) -> NativeSocketEvents {
         NativeSocketEvents {
             receiver: self.events.subscribe(),
         }
     }
 
+    /// Creates a receiver for subsequent socket status changes.
     pub fn status_changes(&self) -> NativeSocketStatusChanges {
         NativeSocketStatusChanges {
             receiver: self.status.clone(),
         }
     }
 
+    /// Returns the latest worker-thread status.
     pub fn worker_status(&self) -> NativeWorkerStatus {
         self.owner.status.borrow().clone()
     }
 
+    /// Creates a receiver for subsequent worker-thread status changes.
     pub fn worker_status_changes(&self) -> NativeWorkerStatusChanges {
         NativeWorkerStatusChanges {
             receiver: self.owner.status.clone(),
         }
     }
 
+    /// Enables connection attempts.
     pub async fn connect(&self) -> Result<(), NativeRuntimeError> {
         self.unit_request(|request_id, response| HostCommand::Connect {
             request_id,
@@ -447,6 +497,7 @@ impl NativeSocket {
         .await
     }
 
+    /// Sends a heartbeat with the configured call timeout and returns its RTT.
     pub async fn ping(&self) -> Result<Duration, NativeRuntimeError> {
         self.request(|request_id, response| HostCommand::Ping {
             request_id,
@@ -456,6 +507,7 @@ impl NativeSocket {
         .await
     }
 
+    /// Sends a heartbeat with an explicit timeout and returns its RTT.
     pub async fn ping_with_timeout(
         &self,
         timeout: Duration,
@@ -468,6 +520,7 @@ impl NativeSocket {
         .await
     }
 
+    /// Disables automatic reconnection and closes the active transport.
     pub async fn disconnect(&self) -> Result<(), NativeRuntimeError> {
         self.unit_request(|request_id, response| HostCommand::Disconnect {
             request_id,
@@ -476,6 +529,7 @@ impl NativeSocket {
         .await
     }
 
+    /// Disconnects with an explicit WebSocket close code and reason.
     pub async fn disconnect_with(
         &self,
         code: u16,
@@ -491,6 +545,7 @@ impl NativeSocket {
         .await
     }
 
+    /// Registers a channel with a static join payload.
     pub async fn channel(
         &self,
         topic: impl Into<String>,
@@ -500,6 +555,7 @@ impl NativeSocket {
             .await
     }
 
+    /// Registers a channel with a payload loader evaluated for every join.
     pub async fn channel_with_loader(
         &self,
         topic: impl Into<String>,
@@ -524,6 +580,7 @@ impl NativeSocket {
         })
     }
 
+    /// Permanently stops and joins the dedicated worker.
     pub async fn shutdown(&self) -> Result<(), NativeRuntimeError> {
         let command_result = self
             .unit_command(|response| HostCommand::Shutdown { response })
@@ -534,6 +591,9 @@ impl NativeSocket {
         }
     }
 
+    /// Blocks the current thread until the worker exits.
+    ///
+    /// Async callers should normally use [`NativeSocket::shutdown`] instead.
     pub fn join_worker(&self) -> Result<(), NativeRuntimeError> {
         self.owner.join()
     }
@@ -569,29 +629,35 @@ impl NativeSocket {
     }
 }
 
+/// Independent bounded native socket event receiver.
 pub struct NativeSocketEvents {
     receiver: broadcast::Receiver<SocketEvent>,
 }
 
 impl NativeSocketEvents {
+    /// Waits for the next socket event.
     pub async fn next(&mut self) -> Result<SocketEvent, NativeEventError> {
         receive_event(&mut self.receiver).await
     }
 }
 
+/// Receiver for managed socket status changes.
 pub struct NativeSocketStatusChanges {
     receiver: watch::Receiver<SocketStatus>,
 }
 
+/// Receiver for dedicated worker-thread status changes.
 pub struct NativeWorkerStatusChanges {
     receiver: watch::Receiver<NativeWorkerStatus>,
 }
 
 impl NativeWorkerStatusChanges {
+    /// Returns the latest worker status without waiting.
     pub fn current(&self) -> NativeWorkerStatus {
         self.receiver.borrow().clone()
     }
 
+    /// Waits for and returns the next worker status.
     pub async fn changed(&mut self) -> Result<NativeWorkerStatus, NativeEventError> {
         self.receiver
             .changed()
@@ -602,10 +668,12 @@ impl NativeWorkerStatusChanges {
 }
 
 impl NativeSocketStatusChanges {
+    /// Returns the latest socket status without waiting.
     pub fn current(&self) -> SocketStatus {
         *self.receiver.borrow()
     }
 
+    /// Waits for and returns the next socket status.
     pub async fn changed(&mut self) -> Result<SocketStatus, NativeEventError> {
         self.receiver
             .changed()
@@ -615,6 +683,7 @@ impl NativeSocketStatusChanges {
     }
 }
 
+/// `Send + Sync` handle for one Phoenix channel topic.
 #[derive(Clone)]
 pub struct NativeChannel {
     inner: Arc<NativeChannelInner>,
@@ -638,26 +707,31 @@ impl Drop for NativeChannelInner {
 }
 
 impl NativeChannel {
+    /// Returns the registered topic.
     pub fn topic(&self) -> &str {
         &self.inner.topic
     }
 
+    /// Returns the latest channel status.
     pub fn status(&self) -> ChannelStatus {
         *self.inner.status.borrow()
     }
 
+    /// Creates an independent bounded channel event receiver.
     pub fn events(&self) -> NativeChannelEvents {
         NativeChannelEvents {
             receiver: self.inner.events.subscribe(),
         }
     }
 
+    /// Creates a receiver for subsequent channel status changes.
     pub fn status_changes(&self) -> NativeChannelStatusChanges {
         NativeChannelStatusChanges {
             receiver: self.inner.status.clone(),
         }
     }
 
+    /// Creates a synchronized Presence consumer for this channel.
     pub fn presence(&self) -> NativeChannelPresence {
         NativeChannelPresence {
             channel: self.clone(),
@@ -668,6 +742,7 @@ impl NativeChannel {
         }
     }
 
+    /// Subscribes to application messages with one event name.
     pub fn subscribe(&self, event: impl Into<String>) -> NativeEventSubscription {
         NativeEventSubscription {
             event: event.into(),
@@ -675,6 +750,7 @@ impl NativeChannel {
         }
     }
 
+    /// Joins with the configured default timeout.
     pub async fn join(&self) -> Result<Payload, NativeRuntimeError> {
         self.request(|request_id, response| HostCommand::Join {
             request_id,
@@ -685,6 +761,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Joins with an explicit timeout.
     pub async fn join_with_timeout(
         &self,
         timeout: Duration,
@@ -698,6 +775,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Sends an event and waits for its correlated reply.
     pub async fn call(
         &self,
         event: impl Into<String>,
@@ -714,6 +792,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Sends an event and waits up to `timeout` for its reply.
     pub async fn call_with_timeout(
         &self,
         event: impl Into<String>,
@@ -731,6 +810,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Serializes a JSON request, requires an `ok` reply, and decodes it.
     pub async fn call_json<Request, Response>(
         &self,
         event: impl Into<String>,
@@ -747,6 +827,7 @@ impl NativeChannel {
             .map_err(Into::into)
     }
 
+    /// Sends an event without asking Phoenix for a reply.
     pub async fn cast(
         &self,
         event: impl Into<String>,
@@ -763,6 +844,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Sends a cast, waiting at most `timeout` for transport acceptance.
     pub async fn cast_with_timeout(
         &self,
         event: impl Into<String>,
@@ -780,6 +862,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Leaves with the configured default timeout.
     pub async fn leave(&self) -> Result<Payload, NativeRuntimeError> {
         self.request(|request_id, response| HostCommand::Leave {
             request_id,
@@ -790,6 +873,7 @@ impl NativeChannel {
         .await
     }
 
+    /// Leaves and waits up to `timeout` for the server reply.
     pub async fn leave_with_timeout(
         &self,
         timeout: Duration,
@@ -873,10 +957,12 @@ impl Drop for HostRequestGuard {
     }
 }
 
+/// Independent bounded native channel event receiver.
 pub struct NativeChannelEvents {
     receiver: broadcast::Receiver<ChannelEvent>,
 }
 
+/// Current Presence state and changes for a native channel.
 pub struct NativeChannelPresence {
     channel: NativeChannel,
     events: NativeChannelEvents,
@@ -885,16 +971,19 @@ pub struct NativeChannelPresence {
     desynchronized: bool,
 }
 
+/// Filtered native subscription for one application event name.
 pub struct NativeEventSubscription {
     event: String,
     events: NativeChannelEvents,
 }
 
 impl NativeEventSubscription {
+    /// Returns the event name matched by this subscription.
     pub fn event(&self) -> &str {
         &self.event
     }
 
+    /// Waits for the next matching message or channel lifecycle event.
     pub async fn next(&mut self) -> Result<SubscriptionEvent, NativeEventError> {
         loop {
             match self.events.next().await? {
@@ -919,27 +1008,38 @@ impl NativeEventSubscription {
     }
 }
 
+/// Failure while consuming native Presence state and events.
 #[derive(Debug, Error)]
 pub enum NativePresenceError {
+    /// The underlying channel event receiver lagged or closed.
     #[error(transparent)]
     Events(#[from] NativeEventError),
+    /// A Presence state or diff payload was invalid.
     #[error(transparent)]
     Decode(#[from] PresenceError),
+    /// The bounded event stream dropped events and invalidated local state.
     #[error("presence event stream dropped {dropped} events and must be resynchronized")]
-    Desynchronized { dropped: u64 },
+    Desynchronized {
+        /// Number of dropped events.
+        dropped: u64,
+    },
+    /// [`NativeChannelPresence::resync`] is required before consuming events.
     #[error("presence state must be resynchronized before consuming more events")]
     ResyncRequired,
 }
 
 impl NativeChannelPresence {
+    /// Returns the current synchronized Presence state.
     pub fn state(&self) -> &PresenceState {
         self.tracker.state()
     }
 
+    /// Returns whether event lag invalidated local state.
     pub fn requires_resync(&self) -> bool {
         self.desynchronized
     }
 
+    /// Clears local state, leaves, and rejoins to request a fresh state.
     pub async fn resync(&mut self) -> Result<(), NativeRuntimeError> {
         self.tracker.reset();
         self.pending.clear();
@@ -950,6 +1050,7 @@ impl NativeChannelPresence {
         Ok(())
     }
 
+    /// Waits for the next Presence change or channel lifecycle event.
     pub async fn next(&mut self) -> Result<PresenceEvent, NativePresenceError> {
         if self.desynchronized {
             return Err(NativePresenceError::ResyncRequired);
@@ -1014,20 +1115,24 @@ impl NativeChannelPresence {
 }
 
 impl NativeChannelEvents {
+    /// Waits for the next channel event.
     pub async fn next(&mut self) -> Result<ChannelEvent, NativeEventError> {
         receive_event(&mut self.receiver).await
     }
 }
 
+/// Receiver for native channel status changes.
 pub struct NativeChannelStatusChanges {
     receiver: watch::Receiver<ChannelStatus>,
 }
 
 impl NativeChannelStatusChanges {
+    /// Returns the latest channel status without waiting.
     pub fn current(&self) -> ChannelStatus {
         *self.receiver.borrow()
     }
 
+    /// Waits for and returns the next channel status.
     pub async fn changed(&mut self) -> Result<ChannelStatus, NativeEventError> {
         self.receiver
             .changed()

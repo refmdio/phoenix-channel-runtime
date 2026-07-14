@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["phoenix", "channels", "elixir", "protocol"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
 futures.workspace = true

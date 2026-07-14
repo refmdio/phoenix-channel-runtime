@@ -1,6 +1,7 @@
-//! Native Tokio WebSocket transport.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(rustdoc::broken_intra_doc_links)]
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
@@ -31,16 +32,19 @@ mod native {
     };
     use url::Url;
 
+    /// Tokio Tungstenite transport implementing the runtime-neutral transport API.
     pub struct NativeTransport {
         inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
     }
 
+    /// Connector for native `ws` and `wss` WebSocket endpoints.
     #[derive(Clone)]
     pub struct NativeConnector {
         endpoint: NativeEndpoint,
         options: NativeTransportOptions,
     }
 
+    /// HTTP CONNECT proxy URL and host bypass rules.
     #[derive(Clone)]
     pub struct ProxyConfig {
         url: String,
@@ -58,6 +62,7 @@ mod native {
     }
 
     impl ProxyConfig {
+        /// Creates proxy configuration for an HTTP proxy URL.
         pub fn new(url: impl Into<String>) -> Self {
             Self {
                 url: url.into(),
@@ -65,6 +70,7 @@ mod native {
             }
         }
 
+        /// Bypasses the proxy for a host and all of its subdomains.
         pub fn bypass_host(mut self, host: impl Into<String>) -> Self {
             self.bypass_hosts.push(host.into());
             self
@@ -81,6 +87,7 @@ mod native {
         }
     }
 
+    /// TLS, proxy, header, and WebSocket limit settings for native transports.
     #[derive(Clone)]
     pub struct NativeTransportOptions {
         headers: Vec<(String, String)>,
@@ -127,31 +134,37 @@ mod native {
     }
 
     impl NativeTransportOptions {
+        /// Adds an HTTP header to the WebSocket upgrade request.
         pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
             self.headers.push((name.into(), value.into()));
             self
         }
 
+        /// Uses an application-provided Rustls client configuration.
         pub fn tls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
             self.tls_config = Some(config);
             self
         }
 
+        /// Routes applicable connections through an HTTP CONNECT proxy.
         pub fn proxy(mut self, proxy: ProxyConfig) -> Self {
             self.proxy = Some(proxy);
             self
         }
 
+        /// Sets the maximum accepted WebSocket message size, or disables it.
         pub fn max_message_size(mut self, value: Option<usize>) -> Self {
             self.max_message_size = value;
             self
         }
 
+        /// Sets the maximum accepted WebSocket frame size, or disables it.
         pub fn max_frame_size(mut self, value: Option<usize>) -> Self {
             self.max_frame_size = value;
             self
         }
 
+        /// Enables or disables TCP `nodelay` on direct and proxied connections.
         pub fn disable_nagle(mut self, value: bool) -> Self {
             self.disable_nagle = value;
             self
@@ -165,6 +178,7 @@ mod native {
     }
 
     impl NativeConnector {
+        /// Creates a connector for an already-resolved WebSocket URL.
         pub fn new(url: impl Into<String>) -> Self {
             Self {
                 endpoint: NativeEndpoint::Url(url.into()),
@@ -172,6 +186,7 @@ mod native {
             }
         }
 
+        /// Creates a connector that resolves a Phoenix [`Endpoint`] each attempt.
         pub fn from_endpoint(endpoint: Endpoint) -> Self {
             Self {
                 endpoint: NativeEndpoint::Phoenix(endpoint),
@@ -179,11 +194,13 @@ mod native {
             }
         }
 
+        /// Adds an HTTP header to the WebSocket upgrade request.
         pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
             self.options = self.options.header(name, value);
             self
         }
 
+        /// Replaces the native transport options.
         pub fn options(mut self, options: NativeTransportOptions) -> Self {
             self.options = options;
             self
@@ -219,6 +236,7 @@ mod native {
         }
     }
 
+    /// Tokio timer using monotonic [`std::time::Instant`] measurements.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct NativeTimer;
 
@@ -234,6 +252,7 @@ mod native {
     }
 
     impl NativeTransport {
+        /// Opens an already-resolved WebSocket URL with default options.
         pub async fn connect(url: &str) -> Result<Self, TransportError> {
             Self::connect_resolved(
                 ResolvedEndpoint {

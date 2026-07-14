@@ -2,6 +2,7 @@ use std::rc::Rc;
 
 use super::{ChannelEvent, SocketEvent, TelemetryEvent, TelemetryHook};
 
+/// Creates a telemetry hook that emits structured events through `tracing`.
 pub fn tracing_telemetry_hook() -> TelemetryHook {
     Rc::new(|event| match event {
         TelemetryEvent::Socket(socket) => match socket {

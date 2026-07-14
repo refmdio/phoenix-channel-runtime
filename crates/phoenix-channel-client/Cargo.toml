@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["phoenix", "channels", "elixir", "websocket"]
+categories = ["asynchronous", "network-programming", "web-programming::websocket"]
 
 [dependencies]
 base64.workspace = true
@@ -20,3 +23,6 @@ tracing = { version = "0.1.44", optional = true }
 [features]
 default = []
 tracing = ["dep:tracing"]
+
+[package.metadata.docs.rs]
+all-features = true

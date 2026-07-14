@@ -7,35 +7,60 @@ use thiserror::Error;
 
 use super::{Channel, ChannelEvent, ChannelEvents, ClientError};
 
+/// A synchronized Presence change or channel lifecycle event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PresenceEvent {
+    /// A key or one of its metas joined.
     Joined {
+        /// Application-defined Presence key.
         key: String,
+        /// Entry before the join, if the key was already present.
         current: Option<Presence>,
+        /// Entry or metas added by this update.
         joined: Presence,
     },
+    /// A key or one of its metas left.
     Left {
+        /// Application-defined Presence key.
         key: String,
+        /// Entry before the leave was applied.
         current: Presence,
+        /// Entry or metas removed by this update.
         left: Presence,
     },
+    /// A full state or diff was applied.
     Synced,
+    /// The socket disconnected and local Presence state was cleared.
     Disconnected,
+    /// The channel was explicitly left and local state was cleared.
     ChannelLeft,
+    /// The server closed the channel and local state was cleared.
     ChannelClosed,
+    /// The channel errored and local state was cleared.
     ChannelError,
 }
 
+/// Failure while decoding or consuming a Presence event stream.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PresenceStreamError {
+    /// A Presence state or diff payload was invalid.
     #[error(transparent)]
     Decode(#[from] PresenceError),
+    /// The bounded channel event stream dropped events.
     #[error("presence event stream dropped {dropped} events and must be resynchronized")]
-    Desynchronized { dropped: u64 },
+    Desynchronized {
+        /// Number of channel events dropped before lag was observed.
+        dropped: u64,
+    },
+    /// [`ChannelPresence::resync`] is required before consuming more events.
     #[error("presence state must be resynchronized before consuming more events")]
     ResyncRequired,
 }
 
+/// Current Presence state and changes for a joined channel.
+///
+/// The value borrows its [`Channel`] so a resynchronization can leave and
+/// rejoin the same channel with a freshly loaded join payload.
 pub struct ChannelPresence<'a> {
     channel: &'a Channel,
     events: ChannelEvents,
@@ -55,14 +80,17 @@ impl<'a> ChannelPresence<'a> {
         })
     }
 
+    /// Returns the current synchronized state.
     pub fn state(&self) -> &PresenceState {
         self.tracker.state()
     }
 
+    /// Returns whether event lag invalidated local state.
     pub fn requires_resync(&self) -> bool {
         self.desynchronized
     }
 
+    /// Clears local state, leaves, and rejoins to request a fresh full state.
     pub async fn resync(&mut self) -> Result<(), ClientError> {
         self.tracker.reset();
         self.pending.clear();
@@ -73,6 +101,7 @@ impl<'a> ChannelPresence<'a> {
         Ok(())
     }
 
+    /// Returns the next Presence change or lifecycle event.
     pub async fn next(&mut self) -> Option<Result<PresenceEvent, PresenceStreamError>> {
         if self.desynchronized {
             return Some(Err(PresenceStreamError::ResyncRequired));
