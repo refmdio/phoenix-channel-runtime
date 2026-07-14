@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 base64.workspace = true
 futures.workspace = true
-phoenix-channel-runtime = { path = "../phoenix-channel-runtime" }
+phoenix-channel-runtime = { version = "0.1.0", path = "../phoenix-channel-runtime" }
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
