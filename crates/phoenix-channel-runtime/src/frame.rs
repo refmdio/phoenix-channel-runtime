@@ -1,7 +1,7 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::Payload;
+use crate::{EventRoute, Payload, PayloadError};
 
 /// A Phoenix Channels v2 JSON frame.
 ///
@@ -71,6 +71,14 @@ impl Frame {
             payload: Payload::Json(values[4].clone()),
         })
     }
+
+    pub fn route<R: EventRoute>(&self) -> Result<Option<R::Output>, PayloadError> {
+        if self.event == R::EVENT {
+            self.payload.deserialize().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn decode_reference(value: &Value, field: &'static str) -> Result<Option<String>, FrameCodecError> {
@@ -98,6 +106,7 @@ pub enum FrameCodecError {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
@@ -129,5 +138,26 @@ mod tests {
         let error = Frame::decode_text(r#"[null,"1","topic","event"]"#).unwrap_err();
 
         assert!(matches!(error, FrameCodecError::InvalidLength(4)));
+    }
+
+    #[test]
+    fn routes_typed_event_payloads() {
+        #[derive(Deserialize, PartialEq, Debug)]
+        struct Updated {
+            version: u64,
+        }
+
+        struct UpdatedRoute;
+
+        impl EventRoute for UpdatedRoute {
+            const EVENT: &'static str = "updated";
+            type Output = Updated;
+        }
+
+        let frame = Frame::new(None, None, "room", "updated", json!({"version": 4}));
+        assert_eq!(
+            frame.route::<UpdatedRoute>().unwrap(),
+            Some(Updated { version: 4 })
+        );
     }
 }

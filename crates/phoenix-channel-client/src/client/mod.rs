@@ -28,8 +28,9 @@ use futures::{
     stream::FuturesUnordered,
 };
 use phoenix_channel_runtime::{
-    ChannelState, Codec, Frame, Payload, PhoenixV2Codec, Protocol, ProtocolEvent, ReplyStatus,
-    Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
+    ChannelState, Codec, EventRoute, Frame, Payload, PayloadError, PhoenixV2Codec, Protocol,
+    ProtocolEvent, ReplyStatus, Transport, TransportClose, TransportError, TransportErrorKind,
+    TransportEvent, WireMessage,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -93,6 +94,15 @@ pub enum ChannelEvent {
     Lagged { dropped: u64 },
 }
 
+impl ChannelEvent {
+    pub fn route<R: EventRoute>(&self) -> Result<Option<R::Output>, PayloadError> {
+        match self {
+            Self::Protocol(ProtocolEvent::Message(frame)) => frame.route::<R>(),
+            _ => Ok(None),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelStatus {
     WaitingForSocket,
@@ -109,6 +119,12 @@ pub enum ChannelStatus {
 pub struct Reply {
     pub status: ReplyStatus,
     pub response: Payload,
+}
+
+impl Reply {
+    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, PayloadError> {
+        self.response.deserialize()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -213,6 +229,29 @@ impl<T: Copy + Eq> StatusChanges<T> {
 
 pub type SocketStatusChanges = StatusChanges<SocketStatus>;
 pub type ChannelStatusChanges = StatusChanges<ChannelStatus>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TelemetryEvent {
+    Socket(SocketEvent),
+    Channel {
+        topic: String,
+        event: ChannelEvent,
+    },
+    FrameSent {
+        topic: String,
+        event: String,
+        binary: bool,
+        bytes: usize,
+    },
+    FrameReceived {
+        topic: String,
+        event: String,
+        binary: bool,
+        bytes: usize,
+    },
+}
+
+pub type TelemetryHook = Rc<dyn Fn(&TelemetryEvent)>;
 
 #[derive(Clone)]
 pub struct Socket {
@@ -349,6 +388,11 @@ impl Socket {
             .await
             .map_err(|_| ClientError::DriverStopped)?;
         receiver.await.map_err(|_| ClientError::DriverStopped)
+    }
+
+    pub async fn reconnect(&self) -> Result<(), ClientError> {
+        self.disconnect().await?;
+        self.connect().await
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
@@ -1524,10 +1568,17 @@ impl DriverState {
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
         heartbeat_reference: &mut Option<String>,
     ) -> Result<(), DisconnectReason> {
+        let (binary, bytes) = wire_metadata(&message);
         let frame = self
             .codec
             .decode(message)
             .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
+        self.telemetry(TelemetryEvent::FrameReceived {
+            topic: frame.topic.clone(),
+            event: frame.event.clone(),
+            binary,
+            bytes,
+        });
         let event = self
             .protocol
             .receive(frame)
@@ -1859,10 +1910,19 @@ impl DriverState {
         transport: &mut Box<dyn Transport>,
         frame: Frame,
     ) -> Result<(), DisconnectReason> {
+        let topic = frame.topic.clone();
+        let event = frame.event.clone();
         let message = self
             .codec
             .encode(&frame)
             .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
+        let (binary, bytes) = wire_metadata(&message);
+        self.telemetry(TelemetryEvent::FrameSent {
+            topic,
+            event,
+            binary,
+            bytes,
+        });
         transport
             .send(message)
             .await
@@ -1974,6 +2034,7 @@ impl DriverState {
     }
 
     fn emit_socket(&mut self, event: SocketEvent) {
+        self.telemetry(TelemetryEvent::Socket(event.clone()));
         let status = match &event {
             SocketEvent::Connecting { .. } => SocketStatus::Connecting,
             SocketEvent::Connected => SocketStatus::Connected,
@@ -1997,11 +2058,28 @@ impl DriverState {
     }
 
     fn emit_channel(&mut self, topic: &str, event: ChannelEvent) {
+        self.telemetry(TelemetryEvent::Channel {
+            topic: topic.to_owned(),
+            event: event.clone(),
+        });
         if let Some(channel) = self.channels.get_mut(topic) {
             channel
                 .subscribers
                 .retain_mut(|subscriber| send_bounded(subscriber, event.clone()));
         }
+    }
+
+    fn telemetry(&self, event: TelemetryEvent) {
+        if let Some(hook) = &self.options.telemetry {
+            hook(&event);
+        }
+    }
+}
+
+fn wire_metadata(message: &WireMessage) -> (bool, usize) {
+    match message {
+        WireMessage::Text(value) => (false, value.len()),
+        WireMessage::Binary(value) => (true, value.len()),
     }
 }
 

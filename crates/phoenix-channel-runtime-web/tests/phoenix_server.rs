@@ -4,7 +4,7 @@ use phoenix_channel_client::{
     ChannelEvent, ConnectionConfig, Endpoint, Options, Socket, SocketEvent, static_join_payload,
 };
 use phoenix_channel_runtime::{Payload, ProtocolEvent, ReplyStatus};
-use phoenix_channel_runtime_web::{WebConnector, WebTimer};
+use phoenix_channel_runtime_web::{WebConnector, WebLifecycle, WebTimer};
 use serde_json::json;
 use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -28,6 +28,8 @@ async fn interoperates_with_a_real_phoenix_server() {
         Options::default(),
     );
     let mut socket_events = socket.events().expect("socket events should be available");
+    let mut status_changes = socket.status_changes();
+    let _lifecycle = WebLifecycle::attach(socket.clone()).expect("lifecycle hooks should attach");
     wasm_bindgen_futures::spawn_local(driver);
     loop {
         match socket_events.next().await {
@@ -60,6 +62,26 @@ async fn interoperates_with_a_real_phoenix_server() {
         .await
         .expect("binary call should succeed");
     assert_eq!(reply.response, Payload::Binary(vec![4, 3, 2, 1]));
+
+    let window = web_sys::window().expect("window should be available");
+    window
+        .dispatch_event(&web_sys::Event::new("offline").unwrap())
+        .expect("offline event should dispatch");
+    loop {
+        match status_changes.changed().await {
+            Some(phoenix_channel_client::SocketStatus::Disconnected) => break,
+            Some(_) => {}
+            None => panic!("socket status stream ended while going offline"),
+        }
+    }
+    window
+        .dispatch_event(&web_sys::Event::new("online").unwrap())
+        .expect("online event should dispatch");
+    let reply = channel
+        .call("echo", json!({"after": "online"}))
+        .await
+        .expect("channel should rejoin after returning online");
+    assert_eq!(reply.response, json!({"after": "online"}));
 
     let reply = channel
         .call("broadcast", json!({"value": "hello"}))

@@ -12,7 +12,7 @@ use std::{
 use futures::{FutureExt, future::BoxFuture};
 use phoenix_channel_client::{
     Channel, ChannelEvent, ChannelStatus, ClientError, ConnectContext, ConnectionConfig, Endpoint,
-    EndpointError, JoinContext, Options, Reply, Socket, SocketEvent, SocketStatus,
+    EndpointError, JoinContext, Options, Reply, Socket, SocketEvent, SocketStatus, TelemetryEvent,
 };
 use phoenix_channel_runtime::Payload;
 use serde_json::Value;
@@ -28,6 +28,8 @@ pub type NativeConnectionConfigLoader = Arc<
 pub type NativeJoinPayloadLoader =
     Arc<dyn Fn(JoinContext) -> BoxFuture<'static, Result<Value, String>> + Send + Sync>;
 
+pub type NativeTelemetryHook = Arc<dyn Fn(&TelemetryEvent) + Send + Sync>;
+
 pub fn native_static_connection_config(config: ConnectionConfig) -> NativeConnectionConfigLoader {
     Arc::new(move |_| {
         let config = config.clone();
@@ -42,7 +44,7 @@ pub fn native_static_join_payload(payload: Value) -> NativeJoinPayloadLoader {
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NativeOptions {
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
@@ -55,6 +57,7 @@ pub struct NativeOptions {
     command_capacity: usize,
     push_buffer_capacity: usize,
     event_capacity: usize,
+    telemetry: Option<NativeTelemetryHook>,
 }
 
 impl Default for NativeOptions {
@@ -78,6 +81,7 @@ impl Default for NativeOptions {
             command_capacity: 64,
             push_buffer_capacity: 64,
             event_capacity: 256,
+            telemetry: None,
         }
     }
 }
@@ -145,10 +149,15 @@ impl NativeOptions {
         self
     }
 
+    pub fn telemetry(mut self, hook: NativeTelemetryHook) -> Self {
+        self.telemetry = Some(hook);
+        self
+    }
+
     fn client_options(&self) -> Options {
         let reconnect_delays = self.reconnect_delays.clone();
         let rejoin_delays = self.rejoin_delays.clone();
-        Options::default()
+        let mut options = Options::default()
             .connect_on_start(false)
             .heartbeat_interval(self.heartbeat_interval)
             .heartbeat_timeout(self.heartbeat_timeout)
@@ -160,7 +169,12 @@ impl NativeOptions {
             .reconnect_delay(move |attempt| retry_delay(&reconnect_delays, attempt))
             .rejoin_delay(move |attempt| retry_delay(&rejoin_delays, attempt))
             .command_capacity(self.command_capacity)
-            .push_buffer_capacity(self.push_buffer_capacity)
+            .push_buffer_capacity(self.push_buffer_capacity);
+        if let Some(hook) = &self.telemetry {
+            let hook = hook.clone();
+            options = options.telemetry(Rc::new(move |event| hook(event)));
+        }
+        options
     }
 }
 
@@ -783,6 +797,7 @@ mod tests {
     fn native_handles_are_send_and_sync() {
         assert_send_sync::<NativeSocket>();
         assert_send_sync::<NativeChannel>();
+        assert_send_sync::<NativeOptions>();
     }
 
     #[test]

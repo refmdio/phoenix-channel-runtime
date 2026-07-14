@@ -280,6 +280,49 @@ fn configures_operation_timeouts_independently() {
 }
 
 #[test]
+fn emits_structured_telemetry_for_socket_channel_and_frames() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let telemetry = {
+        let observed = observed.clone();
+        Rc::new(move |event: &TelemetryEvent| observed.borrow_mut().push(event.clone()))
+    };
+    let options = Options::default().telemetry(telemetry);
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async {
+        let channel = socket
+            .channel("room:lobby", static_join_payload(json!({})))
+            .unwrap();
+        let server = async {
+            let join = next_frame(&mut peer).await;
+            reply(&peer, &join, "ok", json!({}));
+        };
+        let (_, joined) = futures::join!(server, channel.join());
+        joined.unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let observed = observed.borrow();
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        TelemetryEvent::FrameSent { event, .. } if event == "phx_join"
+    )));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        TelemetryEvent::FrameReceived { event, .. } if event == "phx_reply"
+    )));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        TelemetryEvent::Channel { topic, .. } if topic == "room:lobby"
+    )));
+}
+
+#[test]
 fn times_out_a_stalled_connection_attempt() {
     let (timer, mut timer_requests) = timer();
     let timeout = Duration::from_millis(43);

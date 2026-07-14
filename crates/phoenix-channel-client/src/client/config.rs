@@ -4,6 +4,8 @@ use futures::future::LocalBoxFuture;
 use phoenix_channel_runtime::{Transport, TransportError};
 use serde_json::Value;
 
+use super::TelemetryHook;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectContext {
     pub attempt: u32,
@@ -52,6 +54,7 @@ pub struct Options {
     pub(crate) push_buffer_capacity: usize,
     pub(crate) event_capacity: usize,
     pub(crate) connect_on_start: bool,
+    pub(crate) telemetry: Option<TelemetryHook>,
 }
 
 impl Default for Options {
@@ -69,6 +72,7 @@ impl Default for Options {
             push_buffer_capacity: 64,
             event_capacity: 256,
             connect_on_start: true,
+            telemetry: None,
         }
     }
 }
@@ -138,6 +142,11 @@ impl Options {
 
     pub fn connect_on_start(mut self, enabled: bool) -> Self {
         self.connect_on_start = enabled;
+        self
+    }
+
+    pub fn telemetry(mut self, hook: TelemetryHook) -> Self {
+        self.telemetry = Some(hook);
         self
     }
 }

@@ -1,4 +1,10 @@
 use serde_json::Value;
+use thiserror::Error;
+
+pub trait EventRoute {
+    const EVENT: &'static str;
+    type Output: serde::de::DeserializeOwned;
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Payload {
@@ -38,6 +44,11 @@ impl Payload {
             other => Err(other),
         }
     }
+
+    pub fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<T, PayloadError> {
+        let value = self.as_json().ok_or(PayloadError::ExpectedJson)?;
+        serde_json::from_value(value.clone()).map_err(PayloadError::Deserialize)
+    }
 }
 
 impl From<Value> for Payload {
@@ -56,4 +67,12 @@ impl PartialEq<Value> for Payload {
     fn eq(&self, other: &Value) -> bool {
         self.as_json() == Some(other)
     }
+}
+
+#[derive(Debug, Error)]
+pub enum PayloadError {
+    #[error("expected a JSON payload, received binary data")]
+    ExpectedJson,
+    #[error("failed to deserialize a JSON payload: {0}")]
+    Deserialize(#[source] serde_json::Error),
 }
