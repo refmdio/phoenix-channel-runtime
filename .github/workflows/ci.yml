@@ -22,3 +22,24 @@ jobs:
       - run: cargo check -p phoenix-channel-runtime --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-client --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-runtime-web --target wasm32-unknown-unknown
+
+  phoenix-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19"
+      - run: mix deps.get
+        working-directory: tests/fixtures/phoenix_server
+      - run: cargo test -p phoenix-channel-runtime-native --test phoenix_server
+        env:
+          PHOENIX_E2E: "1"
+      - run: mix run --no-halt > /tmp/phoenix-channel-fixture.log 2>&1 &
+        working-directory: tests/fixtures/phoenix_server
+        env:
+          PORT: "4056"
+      - run: cargo install wasm-pack --locked --version 0.13.1
+      - run: wasm-pack test --headless --chrome crates/phoenix-channel-runtime-web
