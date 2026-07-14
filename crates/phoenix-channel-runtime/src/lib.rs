@@ -14,7 +14,9 @@ mod transport;
 pub use frame::{Frame, FrameCodecError};
 pub use protocol::{ChannelState, Outbound, Protocol, ProtocolError, ProtocolEvent, ReplyStatus};
 pub use session::{Session, SessionError};
-pub use transport::{Transport, TransportError, WireMessage};
+pub use transport::{
+    Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
+};
 
 /// Phoenix's current JSON serializer protocol version.
 pub const V2_PROTOCOL_VERSION: &str = "2.0.0";

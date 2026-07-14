@@ -1,8 +1,15 @@
 //! Socket, channel, and connection driver implementation.
 
 mod config;
+mod endpoint;
 
-pub use config::{Connector, JoinContext, JoinPayloadLoader, Options, Timer, static_join_payload};
+pub use config::{
+    ConnectContext, Connector, JoinContext, JoinPayloadLoader, Options, Timer, static_join_payload,
+};
+pub use endpoint::{
+    ConnectionConfig, ConnectionConfigLoader, Endpoint, EndpointError, ResolvedEndpoint,
+    static_connection_config,
+};
 
 use std::{
     cell::{Cell, RefCell},
@@ -21,8 +28,8 @@ use futures::{
     stream::FuturesUnordered,
 };
 use phoenix_channel_runtime::{
-    ChannelState, Frame, Protocol, ProtocolEvent, ReplyStatus, Transport, TransportError,
-    WireMessage,
+    ChannelState, Frame, Protocol, ProtocolEvent, ReplyStatus, Transport, TransportClose,
+    TransportError, TransportErrorKind, TransportEvent, WireMessage,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -33,9 +40,37 @@ type RequestId = u64;
 pub enum SocketEvent {
     Connecting { attempt: u32 },
     Connected,
-    Disconnected { reason: String },
+    Disconnected { reason: DisconnectReason },
     ReconnectScheduled { attempt: u32, delay: Duration },
     Closed,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DisconnectReason {
+    #[error("connection failed: {0}")]
+    Connect(TransportError),
+    #[error("transport failed: {0}")]
+    Transport(TransportError),
+    #[error("connection closed: {0:?}")]
+    Closed(TransportClose),
+    #[error("heartbeat acknowledgement timed out")]
+    HeartbeatTimeout,
+    #[error("protocol failed: {0}")]
+    Protocol(String),
+    #[error("client driver stopped")]
+    DriverStopped,
+}
+
+impl DisconnectReason {
+    fn should_reconnect(&self) -> bool {
+        match self {
+            Self::Closed(close) => close.should_reconnect(),
+            Self::DriverStopped => false,
+            Self::Connect(_) | Self::Transport(_) | Self::HeartbeatTimeout | Self::Protocol(_) => {
+                true
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -569,8 +604,9 @@ impl DriverState {
         let mut attempt = 0;
         loop {
             self.emit_socket(SocketEvent::Connecting { attempt });
-            let connection = self.connector.connect().fuse();
-            futures::pin_mut!(connection);
+            let connection = self.connector.connect(ConnectContext { attempt }).fuse();
+            let connect_timeout = self.timer.sleep(self.options.connect_timeout).fuse();
+            futures::pin_mut!(connection, connect_timeout);
             let connected = loop {
                 let lifecycle = self.lifecycle.next().fuse();
                 let command = self.commands.next().fuse();
@@ -581,6 +617,10 @@ impl DriverState {
                         None => break None,
                     },
                     result = connection => break Some(result),
+                    () = connect_timeout => break Some(Err(TransportError::with_kind(
+                        TransportErrorKind::Connect,
+                        format!("connection attempt timed out after {:?}", self.options.connect_timeout),
+                    ))),
                     command = command => match command {
                         Some(command) => if self.handle_offline_command(command) { break None },
                         None => break None,
@@ -606,12 +646,16 @@ impl DriverState {
                         ConnectedExit::Disconnected(reason) => {
                             let _ = transport.close().await;
                             self.on_disconnect(&reason);
+                            if !reason.should_reconnect() {
+                                self.emit_socket(SocketEvent::Closed);
+                                return;
+                            }
                         }
                     }
                 }
                 Err(error) => {
                     self.emit_socket(SocketEvent::Disconnected {
-                        reason: error.to_string(),
+                        reason: DisconnectReason::Connect(error),
                     });
                 }
             }
@@ -677,7 +721,7 @@ impl DriverState {
             enum Action {
                 Lifecycle(Option<LifecycleCommand>),
                 Command(Option<Command>),
-                Incoming(Result<Option<WireMessage>, TransportError>),
+                Incoming(Result<TransportEvent, TransportError>),
                 Heartbeat,
                 Payload(Option<PayloadResult>),
                 Rejoin(Option<String>),
@@ -733,7 +777,7 @@ impl DriverState {
                     self.handle_connected_lifecycle(command, transport).await
                 }
                 Action::Lifecycle(None) => {
-                    return ConnectedExit::Disconnected("lifecycle channel closed".into());
+                    return ConnectedExit::Disconnected(DisconnectReason::DriverStopped);
                 }
                 Action::Command(Some(Command::Shutdown { response })) => {
                     return ConnectedExit::Shutdown(response);
@@ -748,29 +792,40 @@ impl DriverState {
                     .await
                 }
                 Action::Command(None) => {
-                    return ConnectedExit::Disconnected("command channel closed".into());
+                    return ConnectedExit::Disconnected(DisconnectReason::DriverStopped);
                 }
-                Action::Incoming(Ok(Some(message))) => {
-                    self.handle_incoming(
-                        message,
-                        transport,
-                        &mut payloads,
-                        &mut rejoins,
-                        &mut operation_timeouts,
-                        &mut heartbeat_reference,
-                    )
-                    .await
+                Action::Incoming(Ok(TransportEvent::Message(message))) => {
+                    let awaiting_heartbeat = heartbeat_reference.is_some();
+                    let result = self
+                        .handle_incoming(
+                            message,
+                            transport,
+                            &mut payloads,
+                            &mut rejoins,
+                            &mut operation_timeouts,
+                            &mut heartbeat_reference,
+                        )
+                        .await;
+                    if result.is_ok() && awaiting_heartbeat && heartbeat_reference.is_none() {
+                        heartbeat = self.timer.sleep(self.options.heartbeat_interval);
+                    }
+                    result
                 }
-                Action::Incoming(Ok(None)) => Err("WebSocket connection closed".into()),
-                Action::Incoming(Err(error)) => Err(error.to_string()),
+                Action::Incoming(Ok(TransportEvent::Closed(close))) => {
+                    Err(DisconnectReason::Closed(close))
+                }
+                Action::Incoming(Err(error)) => Err(DisconnectReason::Transport(error)),
                 Action::Heartbeat => {
-                    heartbeat = self.timer.sleep(self.options.heartbeat_interval);
                     if heartbeat_reference.is_some() {
-                        Err("heartbeat acknowledgement timed out".into())
+                        Err(DisconnectReason::HeartbeatTimeout)
                     } else {
                         let outbound = self.protocol.heartbeat();
                         heartbeat_reference = Some(outbound.reference);
-                        self.send_frame(transport, outbound.frame).await
+                        let result = self.send_frame(transport, outbound.frame).await;
+                        if result.is_ok() {
+                            heartbeat = self.timer.sleep(self.options.heartbeat_timeout);
+                        }
+                        result
                     }
                 }
                 Action::Payload(Some((topic, payload_id, payload))) => {
@@ -890,7 +945,7 @@ impl DriverState {
         &mut self,
         command: LifecycleCommand,
         transport: &mut Box<dyn Transport>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         match command {
             LifecycleCommand::Register {
                 topic,
@@ -923,7 +978,7 @@ impl DriverState {
         transport: &mut Box<dyn Transport>,
         payloads: &mut FuturesUnordered<LocalBoxFuture<'static, PayloadResult>>,
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         match command {
             Command::Subscribe { events } => self.socket_subscribers.push(events),
             Command::SubscribeChannel { topic, events } => self.subscribe_channel(&topic, events),
@@ -1007,7 +1062,7 @@ impl DriverState {
                     let outbound = self
                         .protocol
                         .leave(&topic)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
                     self.pending_leaves.insert(
                         outbound.reference.clone(),
                         PendingLeave {
@@ -1130,7 +1185,7 @@ impl DriverState {
         payload: Result<Value, String>,
         transport: &mut Box<dyn Transport>,
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         let Some(channel) = self.channels.get_mut(&topic) else {
             return Ok(());
         };
@@ -1160,7 +1215,7 @@ impl DriverState {
             None => self.protocol.join(&topic, payload),
             Some(_) => return Ok(()),
         }
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
         if let Some(channel) = self.channels.get(&topic) {
             channel.status.set(ChannelStatus::Joining);
         }
@@ -1184,15 +1239,18 @@ impl DriverState {
         rejoins: &mut FuturesUnordered<LocalBoxFuture<'static, String>>,
         operation_timeouts: &mut FuturesUnordered<LocalBoxFuture<'static, OperationTimeout>>,
         heartbeat_reference: &mut Option<String>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         let WireMessage::Text(text) = message else {
-            return Err("Phoenix binary serializer is not implemented".into());
+            return Err(DisconnectReason::Protocol(
+                "Phoenix binary serializer is not implemented".into(),
+            ));
         };
-        let frame = Frame::decode_text(&text).map_err(|error| error.to_string())?;
+        let frame = Frame::decode_text(&text)
+            .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
         let event = self
             .protocol
             .receive(frame)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
 
         match &event {
             ProtocolEvent::Joined {
@@ -1223,7 +1281,7 @@ impl DriverState {
                     let outbound = self
                         .protocol
                         .leave(topic)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
                     self.pending_leaves
                         .insert(outbound.reference.clone(), pending);
                     self.schedule_operation_timeout(
@@ -1380,7 +1438,7 @@ impl DriverState {
         timeout: OperationTimeout,
         payloads: &mut FuturesUnordered<LocalBoxFuture<'static, PayloadResult>>,
         rejoins: &mut FuturesUnordered<LocalBoxFuture<'static, String>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         match timeout {
             OperationTimeout::Join { topic, reference } => {
                 if self.pending_joins.remove(&reference).as_deref() != Some(topic.as_str()) {
@@ -1440,7 +1498,7 @@ impl DriverState {
         &mut self,
         topic: &str,
         transport: &mut Box<dyn Transport>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         loop {
             let push = self
                 .channels
@@ -1458,7 +1516,7 @@ impl DriverState {
         topic: &str,
         push: QueuedPush,
         transport: &mut Box<dyn Transport>,
-    ) -> Result<(), String> {
+    ) -> Result<(), DisconnectReason> {
         match push {
             QueuedPush::Call {
                 id,
@@ -1469,7 +1527,7 @@ impl DriverState {
                 let outbound = self
                     .protocol
                     .push(topic, event, payload)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
                 self.pending_calls
                     .insert(outbound.reference.clone(), PendingCall { id, response });
                 self.send_frame(transport, outbound.frame).await
@@ -1483,7 +1541,7 @@ impl DriverState {
                 let frame = self
                     .protocol
                     .cast(topic, event, payload)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
                 match self.send_frame(transport, frame).await {
                     Ok(()) => {
                         let _ = response.send(Ok(()));
@@ -1502,12 +1560,14 @@ impl DriverState {
         &mut self,
         transport: &mut Box<dyn Transport>,
         frame: Frame,
-    ) -> Result<(), String> {
-        let text = frame.encode_text().map_err(|error| error.to_string())?;
+    ) -> Result<(), DisconnectReason> {
+        let text = frame
+            .encode_text()
+            .map_err(|error| DisconnectReason::Protocol(error.to_string()))?;
         transport
             .send(WireMessage::Text(text))
             .await
-            .map_err(|error| error.to_string())
+            .map_err(DisconnectReason::Transport)
     }
 
     fn cancel(&mut self, id: RequestId) {
@@ -1564,7 +1624,7 @@ impl DriverState {
         }
     }
 
-    fn on_disconnect(&mut self, reason: &str) {
+    fn on_disconnect(&mut self, reason: &DisconnectReason) {
         let events = self.protocol.reset_connection();
         self.pending_joins.clear();
         for (_, pending) in self.pending_calls.drain() {
@@ -1600,7 +1660,7 @@ impl DriverState {
             }
         }
         self.emit_socket(SocketEvent::Disconnected {
-            reason: reason.to_owned(),
+            reason: reason.clone(),
         });
     }
 
@@ -1634,7 +1694,7 @@ impl DriverState {
 
 enum ConnectedExit {
     Shutdown(oneshot::Sender<()>),
-    Disconnected(String),
+    Disconnected(DisconnectReason),
 }
 
 #[cfg(test)]

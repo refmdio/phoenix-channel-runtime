@@ -4,9 +4,17 @@ use futures::future::LocalBoxFuture;
 use phoenix_channel_runtime::{Transport, TransportError};
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectContext {
+    pub attempt: u32,
+}
+
 /// Creates target-specific WebSocket transports for the driver.
 pub trait Connector {
-    fn connect(&self) -> LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>>;
+    fn connect(
+        &self,
+        context: ConnectContext,
+    ) -> LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>>;
 }
 
 /// Supplies sleeps without choosing an executor.
@@ -33,6 +41,8 @@ pub fn static_join_payload(payload: Value) -> JoinPayloadLoader {
 #[derive(Clone)]
 pub struct Options {
     pub(crate) heartbeat_interval: Duration,
+    pub(crate) heartbeat_timeout: Duration,
+    pub(crate) connect_timeout: Duration,
     pub(crate) request_timeout: Duration,
     pub(crate) reconnect_delay: Rc<dyn Fn(u32) -> Duration>,
     pub(crate) rejoin_delay: Rc<dyn Fn(u32) -> Duration>,
@@ -44,6 +54,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             heartbeat_interval: Duration::from_secs(30),
+            heartbeat_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(10),
             reconnect_delay: Rc::new(default_retry_delay),
             rejoin_delay: Rc::new(default_retry_delay),
@@ -56,6 +68,16 @@ impl Default for Options {
 impl Options {
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.heartbeat_timeout = timeout;
+        self
+    }
+
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 

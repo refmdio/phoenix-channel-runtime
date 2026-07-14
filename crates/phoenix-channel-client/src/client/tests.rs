@@ -22,10 +22,13 @@ impl Transport for MockTransport {
         Box::pin(async move { result })
     }
 
-    fn receive<'a>(
-        &'a mut self,
-    ) -> LocalBoxFuture<'a, Result<Option<WireMessage>, TransportError>> {
-        Box::pin(async move { Ok(self.incoming.next().await) })
+    fn receive<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
+        Box::pin(async move {
+            Ok(self.incoming.next().await.map_or_else(
+                || TransportEvent::Closed(TransportClose::connection_ended()),
+                TransportEvent::Message,
+            ))
+        })
     }
 
     fn close<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), TransportError>> {
@@ -39,13 +42,55 @@ struct MockConnector {
 }
 
 impl Connector for MockConnector {
-    fn connect(&self) -> LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>> {
+    fn connect(
+        &self,
+        _context: ConnectContext,
+    ) -> LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>> {
         let result = self
             .transports
             .borrow_mut()
             .pop_front()
             .ok_or_else(|| TransportError::new("no test transport"));
         Box::pin(async move { result })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingConnector;
+
+impl Connector for PendingConnector {
+    fn connect(
+        &self,
+        _context: ConnectContext,
+    ) -> LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>> {
+        Box::pin(futures::future::pending())
+    }
+}
+
+struct ClosingTransport {
+    close: Option<TransportClose>,
+}
+
+impl Transport for ClosingTransport {
+    fn send<'a>(
+        &'a mut self,
+        _message: WireMessage,
+    ) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn receive<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
+        Box::pin(async move {
+            let close = self
+                .close
+                .take()
+                .unwrap_or_else(TransportClose::connection_ended);
+            Ok(TransportEvent::Closed(close))
+        })
+    }
+
+    fn close<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -119,6 +164,67 @@ fn reply(peer: &MockPeer, request: &Frame, status: &str, response: Value) {
         .unwrap()
         .unbounded_send(WireMessage::Text(frame.encode_text().unwrap()))
         .unwrap();
+}
+
+#[test]
+fn stops_after_a_clean_transport_close() {
+    let transport: Box<dyn Transport> = Box::new(ClosingTransport {
+        close: Some(TransportClose::new(Some(1000), "complete", true)),
+    });
+    let connector = connector([transport]);
+    let (timer, _timer_requests) = timer();
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, Options::default());
+    let mut events = socket.events().unwrap();
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::Disconnected {
+                reason: DisconnectReason::Closed(
+                    TransportClose::new(Some(1000), "complete", true,)
+                ),
+            })
+        );
+        assert_eq!(events.next().await, Some(SocketEvent::Closed));
+        assert_eq!(socket.status(), SocketStatus::Closed);
+    });
+}
+
+#[test]
+fn times_out_a_stalled_connection_attempt() {
+    let (timer, mut timer_requests) = timer();
+    let timeout = Duration::from_millis(43);
+    let options = Options::default().connect_timeout(timeout);
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(PendingConnector, timer, options);
+    let mut events = socket.events().unwrap();
+    pool.spawner().spawn_local(driver).unwrap();
+
+    pool.run_until(async move {
+        let request = timer_requests.next().await.unwrap();
+        assert_eq!(request.duration, timeout);
+        request.fire.send(()).unwrap();
+
+        let Some(SocketEvent::Disconnected {
+            reason: DisconnectReason::Connect(error),
+        }) = events.next().await
+        else {
+            panic!("expected a structured connection timeout")
+        };
+        assert_eq!(error.kind(), TransportErrorKind::Connect);
+        assert!(error.message().contains("timed out"));
+        socket.shutdown().await.unwrap();
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::ReconnectScheduled {
+                attempt: 1,
+                delay: Duration::from_secs(1),
+            })
+        );
+        assert_eq!(events.next().await, Some(SocketEvent::Closed));
+    });
 }
 
 #[test]
@@ -280,6 +386,53 @@ fn accepts_heartbeat_acknowledgements() {
         }
 
         socket.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn disconnects_when_a_heartbeat_ack_times_out() {
+    let (transport, mut peer) = connection();
+    let connector = connector([transport]);
+    let (timer, mut timer_requests) = timer();
+    let heartbeat_interval = Duration::from_millis(23);
+    let heartbeat_timeout = Duration::from_millis(5);
+    let options = Options::default()
+        .heartbeat_interval(heartbeat_interval)
+        .heartbeat_timeout(heartbeat_timeout);
+
+    let mut pool = LocalPool::new();
+    let (socket, driver) = Socket::new(connector, timer, options);
+    let mut events = socket.events().unwrap();
+    pool.spawner().spawn_local(driver).unwrap();
+    pool.run_until(async move {
+        let mut held_timers = Vec::new();
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == heartbeat_interval {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+        let heartbeat = next_frame(&mut peer).await;
+        assert_eq!(heartbeat.event, "heartbeat");
+
+        loop {
+            let request = timer_requests.next().await.unwrap();
+            if request.duration == heartbeat_timeout {
+                request.fire.send(()).unwrap();
+                break;
+            }
+            held_timers.push(request);
+        }
+        assert_eq!(
+            events.next().await,
+            Some(SocketEvent::Disconnected {
+                reason: DisconnectReason::HeartbeatTimeout,
+            })
+        );
+        socket.shutdown().await.unwrap();
+        drop(held_timers);
     });
 }
 

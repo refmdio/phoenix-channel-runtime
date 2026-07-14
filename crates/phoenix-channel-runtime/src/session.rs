@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     Frame, FrameCodecError, Protocol, ProtocolError, ProtocolEvent, Transport, TransportError,
-    WireMessage,
+    TransportEvent, WireMessage,
 };
 
 /// A sequential, runtime-neutral Phoenix Channels session.
@@ -133,11 +133,10 @@ impl<T: Transport> Session<T> {
     }
 
     async fn receive_event(&mut self) -> Result<ProtocolEvent, SessionError> {
-        let message = self
-            .transport
-            .receive()
-            .await?
-            .ok_or(SessionError::ConnectionClosed)?;
+        let message = match self.transport.receive().await? {
+            TransportEvent::Message(message) => message,
+            TransportEvent::Closed(close) => return Err(SessionError::ConnectionClosed(close)),
+        };
         let text = match message {
             WireMessage::Text(text) => text,
             WireMessage::Binary(_) => return Err(SessionError::BinarySerializerNotImplemented),
@@ -170,8 +169,8 @@ pub enum SessionError {
     Codec(#[from] FrameCodecError),
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error("WebSocket connection closed")]
-    ConnectionClosed,
+    #[error("WebSocket connection closed: {0:?}")]
+    ConnectionClosed(crate::TransportClose),
     #[error("Phoenix binary serializer is not implemented")]
     BinarySerializerNotImplemented,
 }
@@ -222,11 +221,14 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn receive<'a>(
-            &'a mut self,
-        ) -> LocalBoxFuture<'a, Result<Option<WireMessage>, TransportError>> {
+        fn receive<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
             let message = self.state.borrow_mut().incoming.pop_front();
-            Box::pin(async move { Ok(message) })
+            Box::pin(async move {
+                Ok(message.map_or_else(
+                    || TransportEvent::Closed(crate::TransportClose::connection_ended()),
+                    TransportEvent::Message,
+                ))
+            })
         }
 
         fn close<'a>(&'a mut self) -> LocalBoxFuture<'a, Result<(), TransportError>> {

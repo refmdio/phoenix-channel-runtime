@@ -4,37 +4,70 @@
 
 #[cfg(target_arch = "wasm32")]
 mod web {
-    use std::time::Duration;
+    use std::{pin::Pin, time::Duration};
 
-    use futures::{SinkExt, StreamExt};
-    use gloo_net::websocket::{Message, futures::WebSocket};
+    use futures::{Sink, SinkExt, StreamExt, future::poll_fn};
+    use gloo_net::websocket::{Message, State, WebSocketError, futures::WebSocket};
     use gloo_timers::future::TimeoutFuture;
-    use phoenix_channel_client::{Connector, Timer};
-    use phoenix_channel_runtime::{Transport, TransportError, WireMessage};
+    use phoenix_channel_client::{ConnectContext, Connector, Endpoint, ResolvedEndpoint, Timer};
+    use phoenix_channel_runtime::{
+        Transport, TransportClose, TransportError, TransportErrorKind, TransportEvent, WireMessage,
+    };
 
     pub struct WebTransport {
         inner: WebSocket,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone)]
     pub struct WebConnector {
-        url: String,
+        endpoint: WebEndpoint,
+    }
+
+    #[derive(Clone)]
+    enum WebEndpoint {
+        Url(String),
+        Phoenix(Endpoint),
     }
 
     impl WebConnector {
         pub fn new(url: impl Into<String>) -> Self {
-            Self { url: url.into() }
+            Self {
+                endpoint: WebEndpoint::Url(url.into()),
+            }
+        }
+
+        pub fn from_endpoint(endpoint: Endpoint) -> Self {
+            Self {
+                endpoint: WebEndpoint::Phoenix(endpoint),
+            }
         }
     }
 
     impl Connector for WebConnector {
         fn connect(
             &self,
+            context: ConnectContext,
         ) -> futures::future::LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>>
         {
-            let result = WebTransport::connect(&self.url)
-                .map(|transport| Box::new(transport) as Box<dyn Transport>);
-            Box::pin(async move { result })
+            let endpoint = self.endpoint.clone();
+            Box::pin(async move {
+                let endpoint = match endpoint {
+                    WebEndpoint::Url(url) => ResolvedEndpoint {
+                        url,
+                        protocols: Vec::new(),
+                    },
+                    WebEndpoint::Phoenix(endpoint) => {
+                        endpoint.resolve(context).await.map_err(|error| {
+                            TransportError::with_kind(
+                                TransportErrorKind::Connect,
+                                error.to_string(),
+                            )
+                        })?
+                    }
+                };
+                let transport = WebTransport::connect_resolved(endpoint).await?;
+                Ok(Box::new(transport) as Box<dyn Transport>)
+            })
         }
     }
 
@@ -50,8 +83,32 @@ mod web {
 
     impl WebTransport {
         pub fn connect(url: &str) -> Result<Self, TransportError> {
-            let inner =
-                WebSocket::open(url).map_err(|error| TransportError::new(format!("{error:?}")))?;
+            let inner = WebSocket::open(url).map_err(|error| {
+                TransportError::with_kind(TransportErrorKind::Connect, format!("{error:?}"))
+            })?;
+            Ok(Self { inner })
+        }
+
+        async fn connect_resolved(endpoint: ResolvedEndpoint) -> Result<Self, TransportError> {
+            let mut inner = if endpoint.protocols.is_empty() {
+                WebSocket::open(&endpoint.url)
+            } else {
+                WebSocket::open_with_protocols(&endpoint.url, &endpoint.protocols)
+            }
+            .map_err(|error| {
+                TransportError::with_kind(TransportErrorKind::Connect, format!("{error:?}"))
+            })?;
+            poll_fn(|context| Pin::new(&mut inner).poll_ready(context))
+                .await
+                .map_err(|error| {
+                    TransportError::with_kind(TransportErrorKind::Connect, error.to_string())
+                })?;
+            if !matches!(inner.state(), State::Open) {
+                return Err(TransportError::with_kind(
+                    TransportErrorKind::Connect,
+                    "WebSocket closed before the open event",
+                ));
+            }
             Ok(Self { inner })
         }
     }
@@ -66,26 +123,32 @@ mod web {
                     WireMessage::Text(text) => Message::Text(text),
                     WireMessage::Binary(bytes) => Message::Bytes(bytes),
                 };
-                self.inner
-                    .send(message)
-                    .await
-                    .map_err(|error| TransportError::new(format!("{error:?}")))
+                self.inner.send(message).await.map_err(|error| {
+                    TransportError::with_kind(TransportErrorKind::Send, format!("{error:?}"))
+                })
             })
         }
 
         fn receive<'a>(
             &'a mut self,
-        ) -> futures::future::LocalBoxFuture<'a, Result<Option<WireMessage>, TransportError>>
-        {
+        ) -> futures::future::LocalBoxFuture<'a, Result<TransportEvent, TransportError>> {
             Box::pin(async move {
                 let Some(message) = self.inner.next().await else {
-                    return Ok(None);
+                    return Ok(TransportEvent::Closed(TransportClose::connection_ended()));
                 };
-                let message = message.map_err(|error| TransportError::new(format!("{error:?}")))?;
-                Ok(Some(match message {
-                    Message::Text(text) => WireMessage::Text(text),
-                    Message::Bytes(bytes) => WireMessage::Binary(bytes),
-                }))
+                match message {
+                    Ok(Message::Text(text)) => Ok(TransportEvent::Message(WireMessage::Text(text))),
+                    Ok(Message::Bytes(bytes)) => {
+                        Ok(TransportEvent::Message(WireMessage::Binary(bytes)))
+                    }
+                    Err(WebSocketError::ConnectionClose(close)) => Ok(TransportEvent::Closed(
+                        TransportClose::new(Some(close.code), close.reason, close.was_clean),
+                    )),
+                    Err(error) => Err(TransportError::with_kind(
+                        TransportErrorKind::Receive,
+                        error.to_string(),
+                    )),
+                }
             })
         }
 
@@ -93,9 +156,9 @@ mod web {
             &'a mut self,
         ) -> futures::future::LocalBoxFuture<'a, Result<(), TransportError>> {
             Box::pin(async move {
-                SinkExt::close(&mut self.inner)
-                    .await
-                    .map_err(|error| TransportError::new(format!("{error:?}")))
+                SinkExt::close(&mut self.inner).await.map_err(|error| {
+                    TransportError::with_kind(TransportErrorKind::Close, format!("{error:?}"))
+                })
             })
         }
     }
