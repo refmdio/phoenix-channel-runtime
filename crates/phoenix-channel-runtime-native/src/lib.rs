@@ -4,13 +4,49 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
+    use std::time::Duration;
+
     use futures::{SinkExt, StreamExt};
+    use phoenix_channel_client::{Connector, Timer};
     use phoenix_channel_runtime::{Transport, TransportError, WireMessage};
     use tokio::net::TcpStream;
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
     pub struct NativeTransport {
         inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct NativeConnector {
+        url: String,
+    }
+
+    impl NativeConnector {
+        pub fn new(url: impl Into<String>) -> Self {
+            Self { url: url.into() }
+        }
+    }
+
+    impl Connector for NativeConnector {
+        fn connect(
+            &self,
+        ) -> futures::future::LocalBoxFuture<'static, Result<Box<dyn Transport>, TransportError>>
+        {
+            let url = self.url.clone();
+            Box::pin(async move {
+                let transport = NativeTransport::connect(&url).await?;
+                Ok(Box::new(transport) as Box<dyn Transport>)
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct NativeTimer;
+
+    impl Timer for NativeTimer {
+        fn sleep(&self, duration: Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+            Box::pin(tokio::time::sleep(duration))
+        }
     }
 
     impl NativeTransport {
@@ -77,4 +113,4 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::NativeTransport;
+pub use native::{NativeConnector, NativeTimer, NativeTransport};

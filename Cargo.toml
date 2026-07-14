@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/phoenix-channel-client",
   "crates/phoenix-channel-runtime",
   "crates/phoenix-channel-runtime-native",
   "crates/phoenix-channel-runtime-web",

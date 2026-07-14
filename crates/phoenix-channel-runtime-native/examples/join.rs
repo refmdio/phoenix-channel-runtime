@@ -1,5 +1,5 @@
-use phoenix_channel_runtime::{ProtocolEvent, Session};
-use phoenix_channel_runtime_native::NativeTransport;
+use phoenix_channel_client::{Options, Socket, static_join_payload};
+use phoenix_channel_runtime_native::{NativeConnector, NativeTimer};
 use serde_json::json;
 
 #[tokio::main(flavor = "current_thread")]
@@ -11,17 +11,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(2)
         .unwrap_or_else(|| "room:lobby".into());
 
-    let transport = NativeTransport::connect(&url).await?;
-    let mut session = Session::new(transport);
-    match session.join(topic, json!({})).await? {
-        ProtocolEvent::Joined {
-            topic, response, ..
-        } => println!("joined {topic}: {response}"),
-        ProtocolEvent::JoinError {
-            topic, response, ..
-        } => return Err(format!("join rejected for {topic}: {response}").into()),
-        event => return Err(format!("unexpected join result: {event:?}").into()),
-    }
-    session.close().await?;
-    Ok(())
+    tokio::task::LocalSet::new()
+        .run_until(async move {
+            let (socket, driver) =
+                Socket::new(NativeConnector::new(url), NativeTimer, Options::default());
+            tokio::task::spawn_local(driver);
+
+            let channel = socket.channel(topic.clone(), static_join_payload(json!({})))?;
+            let response = channel.join().await?;
+            println!("joined {topic}: {response}");
+            socket.shutdown().await?;
+            Ok(())
+        })
+        .await
 }

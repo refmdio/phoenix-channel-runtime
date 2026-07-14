@@ -20,4 +20,5 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo check -p phoenix-channel-runtime --target wasm32-unknown-unknown
+      - run: cargo check -p phoenix-channel-client --target wasm32-unknown-unknown
       - run: cargo check -p phoenix-channel-runtime-web --target wasm32-unknown-unknown

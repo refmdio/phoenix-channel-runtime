@@ -254,6 +254,38 @@ impl Protocol {
         })
     }
 
+    /// Builds a push that does not request a reply.
+    ///
+    /// The frame has no `ref`, so it is not tracked as an in-flight request.
+    pub fn cast(
+        &self,
+        topic: &str,
+        event: impl Into<String>,
+        payload: Value,
+    ) -> Result<Frame, ProtocolError> {
+        let join_ref = self
+            .channels
+            .get(topic)
+            .filter(|channel| channel.state == ChannelState::Joined)
+            .map(|channel| channel.join_ref.clone())
+            .ok_or_else(|| ProtocolError::NotJoined(topic.to_owned()))?;
+
+        Ok(Frame::new(Some(join_ref), None, topic, event, payload))
+    }
+
+    /// Stops correlating a push reply, for example after an API timeout.
+    ///
+    /// Join and leave requests cannot be forgotten through this method because
+    /// their replies also transition channel state.
+    pub fn forget_push(&mut self, reference: &str) -> bool {
+        if matches!(self.pending.get(reference), Some(Pending::Push { .. })) {
+            self.pending.remove(reference);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn heartbeat(&mut self) -> Outbound {
         let reference = self.allocate_reference();
         self.pending.insert(reference.clone(), Pending::Heartbeat);
