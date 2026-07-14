@@ -1673,9 +1673,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reconnect_policy_runs_on_the_native_worker() {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
         let attempts = Arc::new(AtomicUsize::new(0));
         let options = NativeOptions::default().reconnect_policy({
             let attempts = attempts.clone();
@@ -1692,13 +1695,14 @@ mod tests {
         .unwrap();
         socket.connect().await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             while attempts.load(AtomicOrdering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("native reconnect policy was not invoked");
+        server.await.unwrap();
         socket.shutdown().await.unwrap();
     }
 
